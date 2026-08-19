@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#101315" />
+    <link rel="icon" href="data:," />
+    <title>Nexious Tunnel</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap");
+      *{margin:0;padding:0;box-sizing:border-box}
+      body{font-family:"IBM Plex Sans","Microsoft YaHei",sans-serif;overflow:hidden}
+      /* ── Dark (default) ── */
+      body{background:#101315}
+      #splash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;background:#101315;z-index:9999;transition:opacity .4s ease}
+      #splash.fade-out{opacity:0;pointer-events:none}
+      .splash-logo{width:48px;height:48px;border:1.5px solid #39d98a;border-radius:8px;display:grid;place-items:center;color:#39d98a;animation:splashPulse 2s ease-in-out infinite}
+      .splash-logo svg{width:24px;height:24px}
+      .splash-text{color:#7f8a86;font-size:12px;letter-spacing:1.5px;font-family:"IBM Plex Mono",monospace}
+      .splash-bar{width:120px;height:2px;background:#252b2e;border-radius:1px;overflow:hidden}
+      .splash-bar-inner{width:40%;height:100%;background:#39d98a;border-radius:1px;animation:splashSlide 1.2s ease-in-out infinite}
+      @keyframes splashPulse{0%,100%{box-shadow:0 0 0 0 rgba(57,217,138,0)}50%{box-shadow:0 0 0 8px rgba(57,217,138,.1)}}
+      @keyframes splashSlide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
+      /* ── Light theme override ── */
+      body.light{background:#f3f5f4}
+      body.light #splash{background:#f3f5f4}
+      body.light .splash-logo{border-color:#239b61;color:#239b61;animation-name:splashPulseLight}
+      body.light .splash-text{color:#68736e}
+      body.light .splash-bar{background:#d8dedb}
+      body.light .splash-bar-inner{background:#239b61}
+      @keyframes splashPulseLight{0%,100%{box-shadow:0 0 0 0 rgba(35,155,97,0)}50%{box-shadow:0 0 0 8px rgba(35,155,97,.12)}}
+    </style>
+    <script>
+      // Detect theme before Vue mounts
+      if(localStorage.getItem('nexious-theme')==='light'||(!localStorage.getItem('nexious-theme')&&window.matchMedia('(prefers-color-scheme:light)').matches)){
+        document.body.classList.add('light');
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content','#f3f5f4');
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app">
+      <div id="splash">
+        <div class="splash-logo">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        </div>
+        <div class="splash-text">NEXIOUS TUNNEL</div>
+        <div class="splash-bar"><div class="splash-bar-inner"></div></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

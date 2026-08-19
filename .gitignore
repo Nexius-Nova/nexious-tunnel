@@ -1,0 +1,53 @@
+# ── Dependencies ──
+node_modules/
+
+# ── Build output ──
+dist/
+*.tsbuildinfo
+
+# ── Data & Database ──
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# ── Tauri ──
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# ── Environment ──
+.env
+.env.local
+.env.*.local
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS files ──
+Thumbs.db
+.DS_Store
+Desktop.ini
+ehthumbs.db
+
+# ── Logs ──
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# ── Test / Coverage ──
+coverage/
+.nyc_output/
+
+# ── Cache ──
+.cache/
+.parcel-cache/
+.vite/
+*.tmp
+*.temp
+
+# ── Playwright CLI artifacts ──
+.playwright-cli/
