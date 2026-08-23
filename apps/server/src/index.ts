@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { db, tunnelRows } from "./db.js";
+import { deployNode, inspectNode } from "./nodeDeployment.js";
 
 const app = express();
 const httpServer = createServer(app);
@@ -76,9 +77,38 @@ const nodeSchema = z.object({
     .regex(
       /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/,
       "请输入不带协议和路径的节点基础域名"
-    ),
-  status: z.enum(["online", "maintenance"])
+    )
 });
+const serverSchema = z.object({
+  connection: z.string().trim().regex(/^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+$/, "请输入 用户名@主机地址"),
+  password: z.string().min(1, "请输入 SSH 密码"),
+  port: z.number().int().min(1).max(65535).default(22),
+  force: z.boolean().default(false)
+});
+const nodeSelect = `SELECT id,name,host,status,server_host,ssh_user,ssh_port,controller_url,
+  controller_token,deploy_status,last_checked_at,last_error FROM nodes`;
+type DeployJob={id:string;nodeId:string;status:"running"|"success"|"error";logs:Array<{time:string;message:string}>;result?:unknown;error?:string};
+const deployJobs=new Map<string,DeployJob>();
+const appendJobLog=(job:DeployJob,message:string)=>job.logs.push({time:new Date().toISOString(),message});
+let lastNodeHealthRefresh=0;
+async function refreshNodeHealth(){
+  if(Date.now()-lastNodeHealthRefresh<10_000)return;
+  lastNodeHealthRefresh=Date.now();
+  const nodes=db.prepare("SELECT id,controller_url,controller_token,deploy_status FROM nodes").all() as Array<{id:string;controller_url:string|null;controller_token:string|null;deploy_status:string}>;
+  await Promise.all(nodes.map(async node=>{
+    if(!node.controller_url||!node.controller_token||node.deploy_status!=="ready"){
+      db.prepare("UPDATE nodes SET status='maintenance' WHERE id=?").run(node.id);return;
+    }
+    try{
+      const response=await fetch(`${node.controller_url.replace(/\/api\/?$/,"")}/api/health`,{headers:{Authorization:`Bearer ${node.controller_token}`},signal:AbortSignal.timeout(4000)});
+      if(!response.ok)throw new Error(`HTTP ${response.status}`);
+      const value=await response.json() as {ok?:boolean};if(!value.ok)throw new Error("健康检查未通过");
+      db.prepare("UPDATE nodes SET status='online',last_checked_at=?,last_error=NULL WHERE id=?").run(new Date().toISOString(),node.id);
+    }catch(error){
+      db.prepare("UPDATE nodes SET status='maintenance',last_checked_at=?,last_error=? WHERE id=?").run(new Date().toISOString(),error instanceof Error?error.message:"节点不可达",node.id);
+    }
+  }));
+}
 
 function domainIsOccupied(
   nodeId: string,
@@ -124,7 +154,7 @@ app.get("/api/dashboard", (_req, res) => {
 });
 app.get("/api/tunnels", (_req, res) => res.json(tunnelRows()));
 app.post("/api/tunnels/:id/token", (req, res) => {
-  const tunnel = (tunnelRows() as Array<{ id: string }>).find(
+  const tunnel = (tunnelRows() as Array<{ id: string;node_host?:string;controller_url?:string }>).find(
     (row) => row.id === req.params.id
   );
   if (!tunnel) return res.status(404).json({ message: "隧道不存在" });
@@ -133,10 +163,13 @@ app.post("/api/tunnels/:id/token", (req, res) => {
     token,
     req.params.id
   );
+  const nodeRelay=tunnel.controller_url
+    ? tunnel.controller_url.replace(/^http/,"ws").replace(/\/api\/?$/,"/relay")
+    : null;
   res.json({
     token,
     tunnelId: req.params.id,
-    relay: `${process.env.RELAY_URL || "ws://127.0.0.1:8787"}/relay`
+    relay: nodeRelay || `${process.env.RELAY_URL || "ws://127.0.0.1:8787"}/relay`
   });
 });
 app.post("/api/tunnels", (req, res) => {
@@ -217,36 +250,78 @@ app.delete("/api/tunnels/:id", (req, res) => {
   if (!result.changes) return res.status(404).json({ message: "隧道不存在" });
   res.status(204).end();
 });
-app.get("/api/nodes", (_req, res) =>
-  res.json(
+app.get("/api/nodes", async (_req, res, next) => {
+  try { await refreshNodeHealth(); res.json(
     db
-      .prepare("SELECT id,name,host,status FROM nodes ORDER BY status,name")
+      .prepare(`${nodeSelect} ORDER BY status,name`)
       .all()
-  )
-);
+  ); } catch(error){next(error)}
+});
 app.post("/api/nodes", (req, res) => {
   const value = nodeSchema.parse(req.body),
     id = `n-${randomUUID().slice(0, 8)}`;
   db.prepare(
     "INSERT INTO nodes (id,name,region,city,latency,load,status,host) VALUES (?,?,?,?,?,?,?,?)"
-  ).run(id, value.name, "默认", "默认", 0, 0, value.status, value.host);
+  ).run(id, value.name, "默认", "默认", 0, 0, "maintenance", value.host);
   res
     .status(201)
     .json(
-      db.prepare("SELECT id,name,host,status FROM nodes WHERE id=?").get(id)
+      db.prepare(`${nodeSelect} WHERE id=?`).get(id)
     );
 });
 app.put("/api/nodes/:id", (req, res) => {
   const value = nodeSchema.parse(req.body);
   const result = db
-    .prepare("UPDATE nodes SET name=?,status=?,host=? WHERE id=?")
-    .run(value.name, value.status, value.host, req.params.id);
+    .prepare("UPDATE nodes SET name=?,host=? WHERE id=?")
+    .run(value.name, value.host, req.params.id);
   if (!result.changes) return res.status(404).json({ message: "节点不存在" });
   res.json(
     db
-      .prepare("SELECT id,name,host,status FROM nodes WHERE id=?")
+      .prepare(`${nodeSelect} WHERE id=?`)
       .get(req.params.id)
   );
+});
+app.post("/api/nodes/:id/inspect", async (req, res, next) => {
+  try {
+    const value = serverSchema.parse(req.body);
+    const [username, host] = value.connection.split("@");
+    const node = db.prepare(`${nodeSelect} WHERE id=?`).get(req.params.id) as Record<string, string> | undefined;
+    if (!node) return res.status(404).json({ message: "节点不存在" });
+    const result = await inspectNode({ host, username, password: value.password, port: value.port }, node.controller_token);
+    db.prepare("UPDATE nodes SET server_host=?,ssh_user=?,ssh_port=?,controller_url=COALESCE(?,controller_url),controller_token=COALESCE(?,controller_token),deploy_status=?,status=?,last_checked_at=?,last_error=? WHERE id=?")
+      .run(host, username, value.port, result.controllerUrl||null, result.token||null, result.healthy ? "ready" : result.configured ? "error" : "unconfigured",result.healthy?"online":"maintenance", new Date().toISOString(), result.healthy ? null : result.message, req.params.id);
+    res.json(result);
+  } catch (error) { next(error); }
+});
+app.post("/api/nodes/:id/deploy", async (req, res, next) => {
+  try {
+    const value = serverSchema.parse(req.body);
+    const [username, host] = value.connection.split("@");
+    if (!db.prepare("SELECT id FROM nodes WHERE id=?").get(req.params.id)) return res.status(404).json({ message: "节点不存在" });
+    db.prepare("UPDATE nodes SET server_host=?,ssh_user=?,ssh_port=?,deploy_status='deploying',last_error=NULL WHERE id=?")
+      .run(host, username, value.port, req.params.id);
+    const active=[...deployJobs.values()].find(job=>job.nodeId===req.params.id&&job.status==="running");
+    if(active)return res.status(409).json({message:"该节点已有部署任务正在运行"});
+    const job:DeployJob={id:randomUUID(),nodeId:req.params.id,status:"running",logs:[]};
+    deployJobs.set(job.id,job);appendJobLog(job,"部署任务已创建");
+    res.status(202).json({jobId:job.id});
+    void (async()=>{try {
+      const result = await deployNode({ host, username, password: value.password, port: value.port },message=>appendJobLog(job,message), value.force);
+      db.prepare("UPDATE nodes SET controller_url=?,controller_token=?,deploy_status='ready',status='online',last_checked_at=?,last_error=NULL WHERE id=?")
+        .run(result.controllerUrl, result.token, new Date().toISOString(), req.params.id);
+      job.result=result;job.status="success";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "自动部署失败";
+      appendJobLog(job,`部署失败：${message}`);job.error=message;job.status="error";
+      db.prepare("UPDATE nodes SET deploy_status='error',last_checked_at=?,last_error=? WHERE id=?")
+        .run(new Date().toISOString(), message.slice(0, 500), req.params.id);
+    }})();
+  } catch (error) { next(error); }
+});
+app.get("/api/deployments/:jobId",(req,res)=>{
+  const job=deployJobs.get(req.params.jobId);if(!job)return res.status(404).json({message:"部署任务不存在或已过期"});
+  const cursor=Math.max(0,Number(req.query.cursor)||0);
+  res.json({jobId:job.id,status:job.status,logs:job.logs.slice(cursor),cursor:job.logs.length,result:job.result,error:job.error});
 });
 app.delete("/api/nodes/:id", (req, res) => {
   const used = db
@@ -304,6 +379,17 @@ app.get("/api/logs", (req, res) => {
 });
 const relay = new WebSocketServer({ server: httpServer, path: "/relay" });
 relay.on("connection", (socket, request) => {
+  const upstream = process.env.RELAY_UPSTREAM;
+  if (upstream) {
+    const target = `${upstream.replace(/\/$/, "")}${request.url || ""}`;
+    const bridge = new WebSocket(target);
+    // 桥接链路必须保持 Relay 原始消息协议，不能注入状态消息。
+    bridge.on("message", (data, isBinary) => { if (socket.readyState === WebSocket.OPEN) socket.send(data, { binary: isBinary }); });
+    socket.on("message", (data, isBinary) => { if (bridge.readyState === WebSocket.OPEN) bridge.send(data, { binary: isBinary }); });
+    const close = () => { try { socket.close(); } catch {} try { bridge.close(); } catch {} };
+    bridge.on("close", close); bridge.on("error", close); socket.on("close", () => { try { bridge.close(); } catch {} });
+    return;
+  }
   const query = new URL(request.url || "", `http://${request.headers.host}`)
     .searchParams;
   const tunnelId = query.get("tunnel"),
@@ -437,7 +523,17 @@ app.use("/public/:tunnelId", (req, res, next) => {
   return forwardToAgent(req.params.tunnelId, path, req, res, next);
 });
 app.use((req, res, next) => {
-  const hostname = req.hostname.toLowerCase();
+  const upstream = process.env.HTTP_UPSTREAM;
+  if (upstream) {
+    const target = `${upstream.replace(/\/$/, "")}${req.originalUrl || "/"}`;
+    const headers = new Headers(req.headers as HeadersInit);
+    ["connection", "upgrade", "keep-alive", "transfer-encoding", "te", "trailer", "proxy-authorization", "proxy-authenticate"].forEach(header => headers.delete(header));
+    headers.set("x-forwarded-host", req.headers.host || "");
+    return fetch(target, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body) })
+      .then(async response => { res.status(response.status); response.headers.forEach((value,key)=>{ if(!["content-length","transfer-encoding","connection"].includes(key.toLowerCase())) res.setHeader(key,value); }); res.send(Buffer.from(await response.arrayBuffer())); })
+      .catch(() => res.status(502).json({ message: "边缘入口无法连接主 Relay" }));
+  }
+  const hostname = String(req.headers["x-forwarded-host"] || req.hostname).split(":")[0].toLowerCase();
   const tunnel = db
     .prepare(
       `
@@ -459,6 +555,7 @@ const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
   res.status(500).json({ message: "服务暂时不可用" });
 };
 app.use(errorHandler);
-httpServer.listen(port, "127.0.0.1", () =>
-  console.log(`Nexious API listening on http://127.0.0.1:${port}`)
+const bindHost=process.env.BIND_HOST||"127.0.0.1";
+httpServer.listen(port, bindHost, () =>
+  console.log(`Nexious API listening on http://${bindHost}:${port}`)
 );

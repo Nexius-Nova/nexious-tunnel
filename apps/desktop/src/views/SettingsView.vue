@@ -2,18 +2,19 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { NButton, NFormItem, NInput, NSwitch, useMessage } from "naive-ui";
-import { MonitorUp, PanelTopClose, Save, Settings2 } from "lucide-vue-next";
+import { MonitorUp, Moon, PanelTopClose, Save, Settings2 } from "lucide-vue-next";
 import type { Preferences } from "../types";
 import PageHeader from "../components/PageHeader.vue";
 import StateBlock from "../components/StateBlock.vue";
 
 const message = useMessage();
+const darkMode = ref(localStorage.getItem("nexious-theme") !== "light");
 const loading = ref(true),
   saving = ref(false);
 const form = reactive<Preferences>({
   autoStart: false,
   minimizeToTray: true,
-  apiUrl: "http://8.134.156.74/api",
+  apiUrl: "http://8.134.156.74",
   apiToken: ""
 });
 const saved = ref<Preferences>({ ...form });
@@ -62,6 +63,11 @@ async function save() {
     saving.value = false;
   }
 }
+function setTheme(value:boolean) {
+  darkMode.value=value;
+  localStorage.setItem("nexious-theme",value?"dark":"light");
+  window.dispatchEvent(new CustomEvent("nexious-theme-change",{detail:value?"dark":"light"}));
+}
 </script>
 
 <template>
@@ -81,7 +87,12 @@ async function save() {
         <i>WINDOWS</i>
       </section>
       <section class="settings-panel">
-        <h2>应用行为</h2>
+        <h2>桌面偏好</h2>
+        <div class="setting-row">
+          <i><Moon /></i>
+          <div><b>深色主题</b><span>切换当前设备上的黑白界面主题</span></div>
+          <n-switch :value="darkMode" aria-label="深色主题" @update:value="setTheme" />
+        </div>
         <div v-for="item in items" :key="item.key" class="setting-row">
           <i><component :is="item.icon" /></i>
           <div>
@@ -92,14 +103,15 @@ async function save() {
         </div>
       </section>
       <section class="settings-panel server-settings">
-        <h2>控制中心连接</h2>
+        <h2>主控制中心</h2>
+        <p class="section-description">用于读取和管理全部边缘节点及隧道。每个节点的独立连接凭据在“边缘节点”页面维护。</p>
         <div class="server-form">
-          <n-form-item label="API 地址"
+          <n-form-item label="主控制中心 API 地址"
             ><n-input
               v-model:value="form.apiUrl"
-              placeholder="https://relay.example.com/api"
+                placeholder="https://relay.example.com"
           /></n-form-item>
-          <n-form-item label="管理 Token"
+          <n-form-item label="主控制中心 Token"
             ><n-input
               v-model:value="form.apiToken"
               type="password"
@@ -177,6 +189,7 @@ async function save() {
 .server-form :deep(.n-form-item) {
   margin: 0;
 }
+.section-description{margin:0;padding:14px 20px 0;color:var(--text-secondary);font-size:12px}
 @media (max-width: 700px) {
   .server-form {
     grid-template-columns: 1fr;

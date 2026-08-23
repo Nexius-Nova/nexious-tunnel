@@ -19,8 +19,20 @@ export interface NodeInfo {
   name: string;
   host: string;
   status: "online" | "maintenance";
+  server_host: string | null;
+  ssh_user: string | null;
+  ssh_port: number;
+  controller_url: string | null;
+  controller_token: string | null;
+  deploy_status: "unconfigured" | "deploying" | "ready" | "error";
+  last_checked_at: string | null;
+  last_error: string | null;
 }
-export type NodeInput = Pick<NodeInfo, "name" | "host" | "status">;
+export type NodeInput = Pick<NodeInfo, "name" | "host">;
+export interface ServerConnectionInput { connection:string; password:string; port:number }
+export interface NodeInspection { configured:boolean; healthy:boolean; token?:string;port?:number;controllerUrl?:string;message:string }
+export interface NodeDeployment { alreadyConfigured:boolean; controllerUrl:string; token:string; version:string }
+export interface DeploymentJob { jobId:string;status:"running"|"success"|"error";logs:Array<{time:string;message:string}>;cursor:number;result?:NodeDeployment;error?:string }
 export interface TrafficPoint {
   timestamp: string;
   inbound: number;

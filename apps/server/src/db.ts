@@ -51,6 +51,19 @@ try {
 } catch {
   /* existing database */
 }
+const nodeColumns = [
+  ["server_host", "TEXT"],
+  ["ssh_user", "TEXT"],
+  ["ssh_port", "INTEGER NOT NULL DEFAULT 22"],
+  ["controller_url", "TEXT"],
+  ["controller_token", "TEXT"],
+  ["deploy_status", "TEXT NOT NULL DEFAULT 'unconfigured'"],
+  ["last_checked_at", "TEXT"],
+  ["last_error", "TEXT"]
+] as const;
+for (const [name, definition] of nodeColumns) {
+  try { db.exec(`ALTER TABLE nodes ADD COLUMN ${name} ${definition}`); } catch { /* existing database */ }
+}
 db.exec(
   "UPDATE nodes SET host=lower(rtrim(replace(replace(host,'https://',''),'http://',''),'/')) WHERE host LIKE 'http://%' OR host LIKE 'https://%'"
 );
@@ -61,7 +74,7 @@ function seed() {
   ).count;
   if (count) return;
   const insertNode = db.prepare(
-    "INSERT INTO nodes VALUES (@id,@name,@region,@city,@latency,@load,@status,@host)"
+    "INSERT INTO nodes (id,name,region,city,latency,load,status,host) VALUES (@id,@name,@region,@city,@latency,@load,@status,@host)"
   );
   [
     {
@@ -187,14 +200,14 @@ function seed() {
     )
   );
 }
-seed();
+if (process.env.NEXIOUS_SKIP_SEED !== "1") seed();
 
 export function tunnelRows() {
   return db
     .prepare(
       `
     SELECT t.id, t.name, t.protocol, t.local_host, t.local_port, t.remote_port,
-      t.node_id, t.status, t.domain, t.created_at, t.auto_start,
+      t.node_id, t.status, t.domain, t.created_at, t.auto_start, n.controller_url,
       n.name node_name, n.host node_host,
       CASE WHEN t.domain IS NOT NULL AND t.domain != ''
         THEN 'https://' || t.domain || '.' || n.host || '/'

@@ -18,7 +18,7 @@ struct DesktopPreferences {
 }
 
 impl Default for DesktopPreferences {
-  fn default() -> Self { Self { auto_start: false, minimize_to_tray: true, api_url: "http://8.134.156.74/api".to_string(), api_token: String::new() } }
+  fn default() -> Self { Self { auto_start: false, minimize_to_tray: true, api_url: "http://8.134.156.74".to_string(), api_token: String::new() } }
 }
 
 struct DesktopPreferencesState {
@@ -118,12 +118,28 @@ fn set_desktop_preferences(state: tauri::State<'_, DesktopPreferencesState>, pre
 async fn api_request(state: tauri::State<'_, DesktopPreferencesState>, method: String, path: String, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
   let preferences = state.value.lock().map_err(|_| "桌面设置不可用".to_string())?.clone();
   if preferences.api_token.trim().is_empty() { return Err("请先在偏好设置中填写管理 Token".to_string()); }
-  let url = format!("{}/{}", preferences.api_url.trim_end_matches('/'), path.trim_start_matches('/'));
+  // 兼容旧版本保存的 `https://host/api`，新版接口路径统一显式包含 `/api`。
+  let mut base_url = preferences.api_url.trim_end_matches('/').to_string();
+  if base_url.ends_with("/api") && path.trim_start_matches('/').starts_with("api/") {
+    base_url.truncate(base_url.len() - 4);
+  }
+  let url = format!("{}/{}", base_url, path.trim_start_matches('/'));
   let method = method.parse::<reqwest::Method>().map_err(|_| "无效的请求方法".to_string())?;
-  let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().map_err(|error| error.to_string())?;
+  let is_deployment = path.ends_with("/deploy");
+  let timeout = if is_deployment { Duration::from_secs(600) } else { Duration::from_secs(30) };
+  let client = reqwest::Client::builder().timeout(timeout).build().map_err(|error| error.to_string())?;
   let mut request = client.request(method, url).bearer_auth(preferences.api_token);
   if let Some(body) = body { request = request.json(&body); }
-  let response = request.send().await.map_err(|error| format!("无法连接控制中心: {error}"))?;
+  let response = request.send().await.map_err(|error| {
+    if error.is_timeout() {
+      if is_deployment { "节点部署等待超时，请检查服务器网络和部署日志".to_string() }
+      else { "控制中心响应超时，请检查网络连接".to_string() }
+    } else if error.is_connect() {
+      format!("无法连接主控制中心，请检查 API 地址和服务状态: {error}")
+    } else {
+      format!("主控制中心请求失败: {error}")
+    }
+  })?;
   let status = response.status();
   if status == reqwest::StatusCode::NO_CONTENT { return Ok(serde_json::Value::Null); }
   let value = response.json::<serde_json::Value>().await.map_err(|_| format!("控制中心返回了无效响应 ({status})"))?;

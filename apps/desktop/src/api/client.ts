@@ -3,6 +3,10 @@ import type {
   Dashboard,
   NodeInfo,
   NodeInput,
+  NodeInspection,
+  NodeDeployment,
+  DeploymentJob,
+  ServerConnectionInput,
   Tunnel,
   TunnelInput
 } from "../types";
@@ -37,41 +41,48 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 }
 export const api = {
-  dashboard: () => request<Dashboard>("/dashboard"),
-  tunnels: () => request<Tunnel[]>("/tunnels"),
-  nodes: () => request<NodeInfo[]>("/nodes"),
+  dashboard: () => request<Dashboard>("/api/dashboard"),
+  tunnels: () => request<Tunnel[]>("/api/tunnels"),
+  nodes: () => request<NodeInfo[]>("/api/nodes"),
   createNode: (value: NodeInput) =>
-    request<NodeInfo>("/nodes", {
+    request<NodeInfo>("/api/nodes", {
       method: "POST",
       body: JSON.stringify(value)
     }),
   updateNode: (id: string, value: NodeInput) =>
-    request<NodeInfo>(`/nodes/${id}`, {
+    request<NodeInfo>(`/api/nodes/${id}`, {
       method: "PUT",
       body: JSON.stringify(value)
     }),
   deleteNode: (id: string) =>
-    request<void>(`/nodes/${id}`, { method: "DELETE" }),
+    request<void>(`/api/nodes/${id}`, { method: "DELETE" }),
+  inspectNode: (id:string, value:ServerConnectionInput) => request<NodeInspection>(`/api/nodes/${id}/inspect`, {
+    method:"POST", body:JSON.stringify(value)
+  }),
+  deployNode: (id:string, value:ServerConnectionInput & {force?:boolean}) => request<{jobId:string}>(`/api/nodes/${id}/deploy`, {
+    method:"POST", body:JSON.stringify(value)
+  }),
+  deployment: (jobId:string,cursor:number) => request<DeploymentJob>(`/api/deployments/${jobId}?cursor=${cursor}`),
   createTunnel: (value: TunnelInput) =>
-    request<Tunnel>("/tunnels", {
+    request<Tunnel>("/api/tunnels", {
       method: "POST",
       body: JSON.stringify(value)
     }),
   updateTunnel: (id: string, value: TunnelInput) =>
-    request<Tunnel>(`/tunnels/${id}`, {
+    request<Tunnel>(`/api/tunnels/${id}`, {
       method: "PUT",
       body: JSON.stringify(value)
     }),
   setTunnelStatus: (id: string, status: Tunnel["status"]) =>
-    request(`/tunnels/${id}/status`, {
+    request(`/api/tunnels/${id}/status`, {
       method: "PATCH",
       body: JSON.stringify({ status })
     }),
   deleteTunnel: (id: string) =>
-    request<void>(`/tunnels/${id}`, { method: "DELETE" }),
+    request<void>(`/api/tunnels/${id}`, { method: "DELETE" }),
   issueToken: (id: string) =>
     request<{ token: string; tunnelId: string; relay: string }>(
-      `/tunnels/${id}/token`,
+      `/api/tunnels/${id}/token`,
       { method: "POST" }
     ),
   logs: (params: {
@@ -86,6 +97,6 @@ export const api = {
         .filter(([, value]) => value !== undefined && value !== "")
         .map(([key, value]) => [key, String(value)])
     );
-    return request<AccessLogPage>(`/logs?${query}`);
+    return request<AccessLogPage>(`/api/logs?${query}`);
   }
 };

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, ref, watch } from "vue";
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   NConfigProvider,
   NDialogProvider,
@@ -44,6 +44,11 @@ function toggleTheme() {
     transitioning.value = false;
   }, 350);
 }
+function syncTheme(event:Event) {
+  isDark.value=(event as CustomEvent<string>).detail==="dark";
+}
+onMounted(()=>window.addEventListener("nexious-theme-change",syncTheme));
+onBeforeUnmount(()=>window.removeEventListener("nexious-theme-change",syncTheme));
 
 const isTauri =
   typeof window !== "undefined" && !!(window as any).__TAURI_INTERNALS__;

@@ -6,7 +6,6 @@ import {
   NForm,
   NFormItem,
   NInput,
-  NSelect,
   NSpace,
   type FormInst,
   type FormRules
@@ -20,7 +19,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{ close: []; submit: [value: NodeInput] }>();
 const formRef = ref<FormInst | null>(null);
-const form = reactive<NodeInput>({ name: "", host: "", status: "online" });
+const form = reactive<NodeInput>({ name: "", host: "" });
 watch(
   () => [props.show, props.node] as const,
   () => {
@@ -28,8 +27,8 @@ watch(
       Object.assign(
         form,
         props.node
-          ? { name: props.node.name, host: props.node.host, status: props.node.status }
-          : { name: "", host: "", status: "online" }
+          ? { name: props.node.name, host: props.node.host }
+          : { name: "", host: "" }
       );
   },
   { immediate: true }
@@ -50,9 +49,6 @@ async function submit() {
     <n-form ref="formRef" :model="form" :rules="rules" label-placement="top">
       <n-form-item label="节点名称" path="name"><n-input v-model:value="form.name" placeholder="例如：主节点" /></n-form-item>
       <n-form-item label="节点域名" path="host"><n-input v-model:value="form.host" placeholder="tunnel.example.com" /></n-form-item>
-      <n-form-item label="运行状态">
-        <n-select v-model:value="form.status" :options="[{ label: '在线', value: 'online' }, { label: '维护中', value: 'maintenance' }]" />
-      </n-form-item>
     </n-form>
     <template #action>
       <n-space justify="end"><n-button @click="emit('close')">取消</n-button><n-button type="primary" :loading="loading" @click="submit">保存节点</n-button></n-space>

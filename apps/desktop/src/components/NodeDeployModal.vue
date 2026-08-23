@@ -1,0 +1,41 @@
+<script setup lang="ts">
+import { nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { useMutation } from "@tanstack/vue-query";
+import { NAlert, NButton, NForm, NFormItem, NInput, NInputNumber, NModal, NSpace, NSteps, NStep, useMessage, type FormInst, type FormRules } from "naive-ui";
+import { CheckCircle2, ServerCog, ShieldCheck } from "lucide-vue-next";
+import { api } from "../api/client";
+import type { NodeDeployment, NodeInfo, ServerConnectionInput } from "../types";
+
+const props=defineProps<{show:boolean;node:NodeInfo|null}>();
+const emit=defineEmits<{close:[];complete:[]}>();
+const message=useMessage(),formRef=ref<FormInst|null>(null),step=ref(1),inspection=ref(""),result=ref<NodeDeployment|null>(null);
+const terminal=ref<Array<{time:string;message:string}>>([]),terminalRef=ref<HTMLElement|null>(null),jobId=ref(""),cursor=ref(0);let pollTimer:number|undefined;
+const forceMode=ref(false);
+const form=reactive<ServerConnectionInput>({connection:"",password:"",port:22});
+const rules:FormRules={connection:{required:true,pattern:/^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+$/,message:"请输入用户名@主机地址",trigger:"blur"},password:{required:true,message:"请输入 SSH 密码",trigger:"blur"}};
+watch(()=>props.show,(show)=>{if(show){forceMode.value=false;inspection.value="";terminal.value=[];jobId.value="";cursor.value=0;Object.assign(form,{connection:props.node?.ssh_user&&props.node.server_host?`${props.node.ssh_user}@${props.node.server_host}`:"",password:"",port:props.node?.ssh_port||22});if(props.node?.deploy_status==="ready"&&props.node.controller_url&&props.node.controller_token){step.value=3;result.value={alreadyConfigured:true,controllerUrl:props.node.controller_url,token:props.node.controller_token,version:"1.0.0"}}else{step.value=1;result.value=null}}else stopPolling()});
+const inspect=useMutation({mutationFn:()=>api.inspectNode(props.node!.id,{...form}),onSuccess:value=>{inspection.value=value.message;step.value=value.healthy?3:2;if(value.healthy){result.value={alreadyConfigured:true,controllerUrl:value.controllerUrl||props.node?.controller_url||`http://${form.connection.split('@')[1]}:${value.port||8788}/api`,token:value.token||props.node?.controller_token||"",version:"1.0.0"};emit("complete")}},onError:error=>message.error(error.message)});
+const deploy=useMutation<{jobId:string}, Error, boolean>({mutationFn:(force)=>api.deployNode(props.node!.id,{...form,force}),onSuccess:value=>{jobId.value=value.jobId;poll()},onError:error=>message.error(error.message)});
+function beginRedeploy(){forceMode.value=true;step.value=2}
+function stopPolling(){if(pollTimer)window.clearTimeout(pollTimer);pollTimer=undefined}
+async function poll(){if(!jobId.value)return;try{const value=await api.deployment(jobId.value,cursor.value);terminal.value.push(...value.logs);cursor.value=value.cursor;await nextTick();if(terminalRef.value)terminalRef.value.scrollTop=terminalRef.value.scrollHeight;if(value.status==="running")pollTimer=window.setTimeout(poll,700);else if(value.status==="success"&&value.result){result.value=value.result;step.value=3;message.success("节点控制中心部署完成");emit("complete")}else{message.error(value.error||"部署失败");emit("complete")}}catch(error){terminal.value.push({time:new Date().toISOString(),message:`进度获取失败，正在重试：${error instanceof Error?error.message:String(error)}`});pollTimer=window.setTimeout(poll,1500)}}
+onBeforeUnmount(stopPolling);
+async function check(){await formRef.value?.validate();inspect.mutate()}
+async function copy(value:string){await navigator.clipboard.writeText(value);message.success("已复制")}
+</script>
+<template><n-modal :show="show" preset="card" title="配置节点服务器" class="deploy-modal" :style="{width:'min(680px, calc(100vw - 32px))'}" :mask-closable="false" @close="emit('close')">
+  <n-steps :current="step" size="small"><n-step title="连接服务器"/><n-step title="检查与部署"/><n-step title="控制中心就绪"/></n-steps>
+  <div class="deploy-body">
+    <n-alert v-if="node" type="info" :bordered="false"><template #icon><ServerCog/></template>将服务器关联到“{{node.name}}”。密码仅用于本次 SSH 会话，不会保存。</n-alert>
+    <n-form ref="formRef" :model="form" :rules="rules" label-placement="top" :disabled="step===3">
+      <div class="connection-grid"><n-form-item label="SSH 连接" path="connection"><n-input v-model:value="form.connection" placeholder="admin@8.134.156.74"/></n-form-item><n-form-item label="端口"><n-input-number v-model:value="form.port" :min="1" :max="65535"/></n-form-item></div>
+      <n-form-item label="SSH 密码" path="password"><n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="输入服务器登录密码"/></n-form-item>
+    </n-form>
+    <n-alert v-if="inspection&&step===2" type="warning" :bordered="false">{{inspection}}，可以继续自动部署。</n-alert>
+    <section v-if="jobId||terminal.length" class="deploy-terminal"><header><span><i/><i/><i/></span><b>DEPLOYMENT STREAM</b><em>{{result?'COMPLETED':'RUNNING'}}</em></header><div ref="terminalRef" class="terminal-output"><p v-for="(line,index) in terminal" :key="index"><time>{{new Date(line.time).toLocaleTimeString('zh-CN',{hour12:false})}}</time><span>$</span>{{line.message}}</p><p v-if="!result" class="terminal-cursor"><time>··:··:··</time><span>$</span><i/></p></div></section>
+    <section v-if="result" class="deploy-result"><div class="result-title"><CheckCircle2/><div><b>独立控制中心已连接</b><span>版本 {{result.version}} · {{result.alreadyConfigured?'复用已有配置':'首次部署'}}</span></div></div><label>API 地址</label><div class="credential"><code>{{result.controllerUrl}}</code><n-button size="small" @click="copy(result.controllerUrl)">复制</n-button></div><label>管理 Token</label><div class="credential"><code>{{result.token}}</code><n-button size="small" @click="copy(result.token)">复制</n-button></div></section>
+  </div>
+  <template #action><n-space justify="space-between"><n-button @click="emit('close')">{{step===3?'完成':'取消'}}</n-button><n-space><n-button v-if="step===3" type="primary" @click="beginRedeploy"><template #icon><ServerCog/></template>一键重新部署</n-button><template v-else><n-button :loading="inspect.isPending.value" @click="check"><template #icon><ShieldCheck/></template>检查服务器</n-button><n-button v-if="step===2" type="primary" :loading="deploy.isPending.value" @click="deploy.mutate(forceMode)">{{forceMode?'确认重新部署':'一键部署并验证'}}</n-button></template></n-space></n-space></template>
+</n-modal></template>
+<style scoped>.deploy-terminal{border:1px solid #26312d;background:#0d1211;color:#c7d3cd;font-family:"IBM Plex Mono",monospace}.deploy-terminal header{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid #26312d;font-size:10px;letter-spacing:1.5px}.deploy-terminal header span{display:flex;gap:4px}.deploy-terminal header i{width:7px;height:7px;border-radius:50%;background:#39d98a}.deploy-terminal header i:nth-child(2){background:#d7a53d}.deploy-terminal header i:nth-child(3){background:#d85d68}.deploy-terminal header em{margin-left:auto;color:#39d98a;font-style:normal}.terminal-output{max-height:190px;overflow:auto;padding:10px 12px;font-size:11px}.terminal-output p{display:flex;gap:9px;margin:0 0 7px;line-height:1.45}.terminal-output time{color:#71807a}.terminal-output span{color:#39d98a}.terminal-cursor i{width:7px;height:14px;background:#39d98a;animation:blink 1s steps(2,start) infinite}@keyframes blink{50%{opacity:0}}</style>
+<style scoped>.deploy-body{display:flex;flex-direction:column;gap:18px;padding:24px 2px 6px}.connection-grid{display:grid;grid-template-columns:1fr 120px;gap:12px}.connection-grid .n-input-number{width:100%}.deploy-result{border:1px solid var(--border-color);padding:18px;background:var(--surface-muted);display:flex;flex-direction:column;gap:8px}.result-title{display:flex;gap:12px;align-items:center;margin-bottom:8px}.result-title>svg{color:var(--accent)}.result-title div{display:flex;flex-direction:column}.result-title span,.deploy-result label{font-size:12px;color:var(--text-secondary)}.credential{display:flex;align-items:center;gap:8px}.credential code{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid var(--border-color);background:var(--surface);padding:8px 10px;font-size:11px}@media(max-width:560px){.connection-grid{grid-template-columns:1fr}.credential{align-items:stretch;flex-direction:column}.credential code{white-space:normal;overflow-wrap:anywhere}}</style>
