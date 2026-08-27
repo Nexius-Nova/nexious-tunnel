@@ -255,11 +255,7 @@ const columns: DataTableColumns<Tunnel> = [
         },
         {
           default: () =>
-            tunnel.status === "running"
-              ? "运行中"
-              : tunnel.auto_start
-                ? "连接中"
-                : "已停止"
+              tunnel.status === "running" ? "运行中" : tunnel.auto_start ? "连接中" : "已停止"
         }
       )
   },

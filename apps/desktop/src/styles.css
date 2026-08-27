@@ -824,12 +824,30 @@ input:focus-visible {
 .theme-light {
   color: #17201c;
   background: #f3f5f4;
+  --surface: #ffffff;
+  --surface-raised: #f8faf9;
+  --border: #d8dedb;
+  --border-subtle: #e1e6e3;
+  --text-primary: #17201c;
+  --text-secondary: #68736e;
+  --text-muted: #8a9690;
+  --accent-dim: rgba(35, 155, 97, 0.08);
+}
+body.theme-light {
+  --surface: #ffffff;
+  --surface-raised: #f8faf9;
+  --border: #d8dedb;
+  --border-subtle: #e1e6e3;
+  --text-primary: #17201c;
+  --text-secondary: #68736e;
+  --text-muted: #8a9690;
+  --accent-dim: rgba(35, 155, 97, 0.08);
 }
 .theme-light .shell {
   background: #f3f5f4;
 }
 .theme-light .content {
-  /* background: #f3f5f4; */
+  background-color: #f3f5f4;
 }
 .theme-light .sidebar {
   background: #ffffff !important;

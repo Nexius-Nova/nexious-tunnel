@@ -207,7 +207,7 @@ export function tunnelRows() {
     .prepare(
       `
     SELECT t.id, t.name, t.protocol, t.local_host, t.local_port, t.remote_port,
-      t.node_id, t.status, t.domain, t.created_at, t.auto_start, n.controller_url,
+      t.node_id, t.status, t.domain, t.created_at, t.auto_start, t.agent_token, n.controller_url, n.controller_token,
       n.name node_name, n.host node_host,
       CASE WHEN t.domain IS NOT NULL AND t.domain != ''
         THEN 'https://' || t.domain || '.' || n.host || '/'

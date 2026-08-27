@@ -18,7 +18,7 @@ struct DesktopPreferences {
 }
 
 impl Default for DesktopPreferences {
-  fn default() -> Self { Self { auto_start: false, minimize_to_tray: true, api_url: "http://8.134.156.74".to_string(), api_token: String::new() } }
+  fn default() -> Self { Self { auto_start: false, minimize_to_tray: true, api_url: "http://127.0.0.1:8787".to_string(), api_token: String::new() } }
 }
 
 struct DesktopPreferencesState {
@@ -75,7 +75,12 @@ async fn run_agent(relay: String, tunnel_id: String, token: String, target: Stri
 }
 
 fn load_preferences(path: &PathBuf) -> DesktopPreferences {
-  fs::read_to_string(path).ok().and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default()
+  let mut preferences: DesktopPreferences = fs::read_to_string(path).ok().and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default();
+  if preferences.api_url.contains("8.134.156.74") || preferences.api_url.contains("relay.nexious-ppt.xyz") {
+    preferences.api_url = "http://127.0.0.1:8787".to_string();
+    if let Ok(content) = serde_json::to_string_pretty(&preferences) { let _ = fs::write(path, content); }
+  }
+  preferences
 }
 
 fn sync_auto_start(enabled: bool) -> Result<(), String> {

@@ -14,7 +14,7 @@ const loading = ref(true),
 const form = reactive<Preferences>({
   autoStart: false,
   minimizeToTray: true,
-  apiUrl: "http://8.134.156.74",
+  apiUrl: "http://127.0.0.1:8787",
   apiToken: ""
 });
 const saved = ref<Preferences>({ ...form });

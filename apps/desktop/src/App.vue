@@ -100,6 +100,7 @@ watch(
   isDark,
   (dark) => {
     document.body.style.backgroundColor = dark ? "#101315" : "#f3f5f4";
+    document.body.classList.toggle("theme-light", !dark);
     document
       .querySelector('meta[name="theme-color"]')
       ?.setAttribute("content", dark ? "#101315" : "#f3f5f4");

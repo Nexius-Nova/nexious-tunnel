@@ -34,6 +34,7 @@ app.use("/api", (req, res, next) => {
   next();
 });
 const agents = new Map<string, WebSocket>();
+db.prepare("UPDATE nodes SET controller_url=replace(controller_url, ':8789/api', ':8788/api') WHERE controller_url LIKE '%:8789/api%'").run();
 const pending = new Map<string, (payload: any) => void>();
 db.prepare("UPDATE tunnels SET status='stopped' WHERE status='running'").run();
 
@@ -153,6 +154,54 @@ app.get("/api/dashboard", (_req, res) => {
   });
 });
 app.get("/api/tunnels", (_req, res) => res.json(tunnelRows()));
+async function syncTunnelToNode(tunnelId: string, action: "upsert" | "delete"): Promise<string | null> {
+  const row = (tunnelRows() as Array<Record<string, any>>).find((item) => item.id === tunnelId);
+  if (!row?.controller_url || !row.controller_token) return "节点控制器未配置";
+  const base = row.controller_url.replace(/\/api\/?$/, "").replace(/:8789$/, ":8788");
+  const endpoint = `${base}/internal/tunnels/sync`;
+  try {
+    const response = await fetch(endpoint, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${row.controller_token}` }, body: JSON.stringify({ action, tunnel: row }), signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`节点同步失败 HTTP ${response.status}`);
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[tunnel-sync] ${tunnelId}: ${message}`);
+    return message;
+  }
+}
+async function syncNodeTunnels(nodeId: string) {
+  const rows = (tunnelRows() as Array<Record<string, any>>).filter((row) => row.node_id === nodeId);
+  const errors: Array<{ tunnelId: string; message: string }> = [];
+  for (const row of rows) {
+    const message = await syncTunnelToNode(row.id, "upsert");
+    if (message) errors.push({ tunnelId: row.id, message });
+  }
+  return { total: rows.length, success: rows.length - errors.length, failed: errors.length, errors };
+}
+async function syncAllTunnels() {
+  for (const row of tunnelRows() as Array<Record<string, any>>) {
+    await syncTunnelToNode(row.id, "upsert");
+  }
+}
+setTimeout(() => { void syncAllTunnels(); }, 1500);
+setInterval(() => { void syncAllTunnels(); }, 30_000);
+app.post("/internal/tunnels/sync", (req, res) => {
+  if (process.env.NEXIOUS_ADMIN_TOKEN && req.headers.authorization !== `Bearer ${process.env.NEXIOUS_ADMIN_TOKEN}`) return res.status(401).json({ message: "节点同步认证失败" });
+  const body = z.object({ action: z.enum(["upsert", "delete"]), tunnel: z.record(z.any()) }).parse(req.body);
+  if (body.action === "delete") db.prepare("DELETE FROM tunnels WHERE id=?").run(body.tunnel.id);
+  else {
+    // 节点控制器使用与主控相同的查询结构，需要先建立对应的本地节点记录。
+    // 主控同步的 node_id/node_host 是可信配置数据；缺失时使用稳定的本地 ID，避免 NOT NULL 约束导致整条隧道丢失。
+    const nodeId = String(body.tunnel.node_id || "node-local");
+    const nodeHost = String(body.tunnel.node_host || "localhost");
+    db.prepare("INSERT OR IGNORE INTO nodes (id,name,region,city,latency,load,status,host) VALUES (?,?,?,?,?,?,?,?)")
+      .run(nodeId, String(body.tunnel.node_name || nodeId), "默认", "默认", 0, 0, "online", nodeHost);
+    db.prepare("UPDATE nodes SET host=?,status='online' WHERE id=?").run(nodeHost, nodeId);
+    db.prepare("INSERT OR REPLACE INTO tunnels (id,name,protocol,local_host,local_port,remote_port,node_id,status,domain,created_at,agent_token,auto_start) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(body.tunnel.id, body.tunnel.name, body.tunnel.protocol, body.tunnel.local_host, body.tunnel.local_port, body.tunnel.remote_port, nodeId, body.tunnel.status || "stopped", body.tunnel.domain, body.tunnel.created_at || new Date().toISOString(), body.tunnel.agent_token || null, body.tunnel.auto_start || 0);
+  }
+  res.json({ ok: true });
+});
 app.post("/api/tunnels/:id/token", (req, res) => {
   const tunnel = (tunnelRows() as Array<{ id: string;node_host?:string;controller_url?:string }>).find(
     (row) => row.id === req.params.id
@@ -163,6 +212,7 @@ app.post("/api/tunnels/:id/token", (req, res) => {
     token,
     req.params.id
   );
+  void syncTunnelToNode(req.params.id, "upsert");
   const nodeRelay=tunnel.controller_url
     ? tunnel.controller_url.replace(/^http/,"ws").replace(/\/api\/?$/,"/relay")
     : null;
@@ -191,6 +241,7 @@ app.post("/api/tunnels", (req, res) => {
     value.domain || null,
     new Date().toISOString()
   );
+  void syncTunnelToNode(id, "upsert");
   res
     .status(201)
     .json(
@@ -216,6 +267,7 @@ app.put("/api/tunnels/:id", (req, res) => {
       req.params.id
     );
   if (!result.changes) return res.status(404).json({ message: "隧道不存在" });
+  void syncTunnelToNode(req.params.id, "upsert");
   res.json(
     (tunnelRows() as Array<{ id: string }>).find(
       (item) => item.id === req.params.id
@@ -234,9 +286,10 @@ app.patch("/api/tunnels/:id/status", (req, res) => {
           )
           .run(req.params.id)
       : db
-          .prepare("UPDATE tunnels SET auto_start=1 WHERE id=?")
+          .prepare("UPDATE tunnels SET status='running',auto_start=1 WHERE id=?")
           .run(req.params.id);
   if (!result.changes) return res.status(404).json({ message: "隧道不存在" });
+  void syncTunnelToNode(req.params.id, "upsert");
   res.json({
     id: req.params.id,
     status,
@@ -248,6 +301,7 @@ app.delete("/api/tunnels/:id", (req, res) => {
     .prepare("DELETE FROM tunnels WHERE id=?")
     .run(req.params.id);
   if (!result.changes) return res.status(404).json({ message: "隧道不存在" });
+  void syncTunnelToNode(req.params.id, "delete");
   res.status(204).end();
 });
 app.get("/api/nodes", async (_req, res, next) => {
@@ -309,7 +363,17 @@ app.post("/api/nodes/:id/deploy", async (req, res, next) => {
       const result = await deployNode({ host, username, password: value.password, port: value.port },message=>appendJobLog(job,message), value.force);
       db.prepare("UPDATE nodes SET controller_url=?,controller_token=?,deploy_status='ready',status='online',last_checked_at=?,last_error=NULL WHERE id=?")
         .run(result.controllerUrl, result.token, new Date().toISOString(), req.params.id);
-      job.result=result;job.status="success";
+      appendJobLog(job, "控制中心已就绪，开始立即同步该节点的隧道配置");
+      const sync = await syncNodeTunnels(req.params.id);
+      if (sync.failed) {
+        const summary = `隧道同步完成：${sync.success}/${sync.total} 成功，${sync.failed} 失败`;
+        appendJobLog(job, `警告：${summary}`);
+        appendJobLog(job, sync.errors.map((item) => `${item.tunnelId}: ${item.message}`).join("；"));
+        db.prepare("UPDATE nodes SET last_error=? WHERE id=?").run(summary, req.params.id);
+      } else {
+        appendJobLog(job, `隧道同步完成：${sync.success}/${sync.total} 成功`);
+      }
+      job.result={...result, sync};job.status="success";
     } catch (error) {
       const message = error instanceof Error ? error.message : "自动部署失败";
       appendJobLog(job,`部署失败：${message}`);job.error=message;job.status="error";
@@ -533,18 +597,21 @@ app.use((req, res, next) => {
       .then(async response => { res.status(response.status); response.headers.forEach((value,key)=>{ if(!["content-length","transfer-encoding","connection"].includes(key.toLowerCase())) res.setHeader(key,value); }); res.send(Buffer.from(await response.arrayBuffer())); })
       .catch(() => res.status(502).json({ message: "边缘入口无法连接主 Relay" }));
   }
-  const hostname = String(req.headers["x-forwarded-host"] || req.hostname).split(":")[0].toLowerCase();
+  const normalizeHost = (value: unknown) => String(value || "").split(",")[0].trim().split(":")[0].replace(/\.$/, "").toLowerCase();
+  const hostCandidates = [req.headers["x-forwarded-host"], req.headers.host, req.hostname]
+    .map(normalizeHost)
+    .filter(Boolean);
   const tunnel = db
     .prepare(
       `
-    SELECT t.id FROM tunnels t JOIN nodes n ON n.id=t.node_id
-    WHERE lower(t.domain || '.' || n.host)=?
+    SELECT t.id, t.domain, n.host FROM tunnels t JOIN nodes n ON n.id=t.node_id
   `
     )
-    .get(hostname) as { id: string } | undefined;
-  if (!tunnel)
+    .all() as Array<{ id: string; domain: string; host: string }>;
+  const matchedTunnel = tunnel.find((item) => hostCandidates.includes(normalizeHost(`${item.domain}.${item.host}`)));
+  if (!matchedTunnel)
     return res.status(404).json({ message: "未找到该域名对应的隧道" });
-  return forwardToAgent(tunnel.id, req.originalUrl || "/", req, res, next);
+  return forwardToAgent(matchedTunnel.id, req.originalUrl || "/", req, res, next);
 });
 const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
   if (error instanceof z.ZodError)

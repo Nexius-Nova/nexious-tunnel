@@ -31,7 +31,8 @@ export interface NodeInfo {
 export type NodeInput = Pick<NodeInfo, "name" | "host">;
 export interface ServerConnectionInput { connection:string; password:string; port:number }
 export interface NodeInspection { configured:boolean; healthy:boolean; token?:string;port?:number;controllerUrl?:string;message:string }
-export interface NodeDeployment { alreadyConfigured:boolean; controllerUrl:string; token:string; version:string }
+export interface TunnelSyncSummary { total:number; success:number; failed:number; errors:Array<{tunnelId:string;message:string}> }
+export interface NodeDeployment { alreadyConfigured:boolean; controllerUrl:string; token:string; version:string; sync?:TunnelSyncSummary }
 export interface DeploymentJob { jobId:string;status:"running"|"success"|"error";logs:Array<{time:string;message:string}>;cursor:number;result?:NodeDeployment;error?:string }
 export interface TrafficPoint {
   timestamp: string;

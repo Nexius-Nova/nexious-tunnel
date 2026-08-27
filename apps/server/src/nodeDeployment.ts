@@ -1,5 +1,6 @@
 import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -104,7 +105,13 @@ export async function deployNode(credentials: ServerCredentials, log: (message:s
 
     log("准备远程部署目录并上传控制中心源码");
     const wrapper = await sftp(client);
-    const sourceRoot = resolve(fileURLToPath(new URL(".", import.meta.url)));
+    const moduleRoot = resolve(fileURLToPath(new URL(".", import.meta.url)));
+    const sourceRoot = existsSync(resolve(moduleRoot, "index.ts"))
+      ? moduleRoot
+      : resolve(process.cwd(), "apps/server/src");
+    if (!existsSync(resolve(sourceRoot, "index.ts"))) {
+      throw new Error("找不到主控源码，无法上传节点控制中心");
+    }
     await exec(client, "rm -rf /tmp/nexious-node-deploy && mkdir -p /tmp/nexious-node-deploy/src");
     await Promise.all([
       upload(wrapper, resolve(sourceRoot, "index.ts"), "/tmp/nexious-node-deploy/src/index.ts"),
@@ -113,7 +120,7 @@ export async function deployNode(credentials: ServerCredentials, log: (message:s
     ]);
     log("控制中心源码上传完成");
     wrapper.end();
-    const selectedPort=Number(await exec(client,"for port in $(seq 8788 8799); do if ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE \"[:.]${port}$\"; then echo $port; exit 0; fi; done; exit 1"));
+    const selectedPort=8788;
     log(`已选择空闲控制中心端口 ${selectedPort}`);
     const token = randomBytes(32).toString("hex");
     const packageJson = JSON.stringify({
