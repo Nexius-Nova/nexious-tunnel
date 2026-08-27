@@ -323,11 +323,12 @@ const logColumns: DataTableColumns<AccessLog> = [
               </div>
               <button @click="router.push('/tunnels')">查看全部 →</button>
             </div>
-            <div
-              v-for="tunnel in dashboard.data.value.tunnels.slice(0, 5)"
-              :key="tunnel.id"
-              class="connection"
-            >
+            <div class="connection-list">
+              <div
+                v-for="tunnel in dashboard.data.value.tunnels.slice(0, 5)"
+                :key="tunnel.id"
+                class="connection"
+              >
               <i :class="tunnel.status" />
               <div>
                 <b>{{ tunnel.name }}</b
@@ -367,6 +368,7 @@ const logColumns: DataTableColumns<AccessLog> = [
                 title="复制地址"
                 @click="copyUrl(tunnel.access_url!)"
               ><Copy :size="13" /></n-button>
+              </div>
             </div>
           </div>
         </section>
@@ -534,15 +536,25 @@ const logColumns: DataTableColumns<AccessLog> = [
   grid-template-columns: 1fr 380px;
   gap: 16px;
   margin-bottom: 20px;
+  align-items: start;
 }
 .chart-section {
+  height: 318px;
   border: 1px solid var(--border, #292f32);
   background: var(--surface, #15191b);
   border-radius: 8px;
   overflow: hidden;
 }
 .connection-panel .panel {
+  height: 318px;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.connection-list {
+  min-height: 0;
+  overflow-y: auto;
 }
 .chart {
   height: 260px;
@@ -717,6 +729,13 @@ const logColumns: DataTableColumns<AccessLog> = [
   }
   .chart {
     height: 200px;
+  }
+  .chart-section {
+    height: 258px;
+  }
+  .connection-panel .panel {
+    height: auto;
+    max-height: 390px;
   }
   .log-toolbar .n-input {
     min-width: 100%;

@@ -1,53 +1,79 @@
-# ── Dependencies ──
+# Dependencies
 node_modules/
+.pnpm-store/
+.npm/
 
-# ── Build output ──
+# Build output
 dist/
+build/
+out/
+release/
 *.tsbuildinfo
 
-# ── Data & Database ──
-data/
-*.db
-*.db-shm
-*.db-wal
-
-# ── Tauri ──
+# Tauri generated files
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
 
-# ── Environment ──
-.env
-.env.local
-.env.*.local
+# Runtime data and databases
+data/
+*.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite-*
+*.sqlite.*
+*.backup
+*.backup-*
 
-# ── IDE / Editor ──
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# IDE and editor files
 .vscode/
 .idea/
+.history/
 *.swp
 *.swo
 *~
 
-# ── OS files ──
-Thumbs.db
+# Operating system files
 .DS_Store
+Thumbs.db
 Desktop.ini
 ehthumbs.db
+._*
 
-# ── Logs ──
+# Logs and diagnostics
 *.log
 npm-debug.log*
 pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.errors.txt
+check-errors.txt
 
-# ── Test / Coverage ──
+# Tests and coverage
 coverage/
 .nyc_output/
+test-results/
+playwright-report/
 
-# ── Cache ──
+# Tool caches and temporary files
 .cache/
 .parcel-cache/
 .vite/
+.turbo/
+.playwright-cli/
 *.tmp
 *.temp
 
-# ── Playwright CLI artifacts ──
-.playwright-cli/
+# Generated archives and package artifacts
+*.tar.gz
+*.tgz
+*.zip
+*.msi
+*.dmg
+*.AppImage
