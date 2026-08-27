@@ -123,6 +123,7 @@ function setTheme(value:boolean) {
       <div class="save-bar">
         <span>{{ changed ? "有尚未保存的更改" : "所有设置均已保存" }}</span>
         <n-button
+          class="save-button"
           type="primary"
           :disabled="!changed"
           :loading="saving"
@@ -190,6 +191,36 @@ function setTheme(value:boolean) {
   margin: 0;
 }
 .section-description{margin:0;padding:14px 20px 0;color:var(--text-secondary);font-size:12px}
+.save-bar :deep(.save-button) {
+  min-width: 132px;
+  height: 40px;
+  padding: 0 18px;
+  border-radius: 7px;
+  font-weight: 600;
+  transition: background-color .2s ease, border-color .2s ease, color .2s ease, box-shadow .2s ease;
+}
+.save-bar :deep(.save-button:not(.n-button--disabled):hover) {
+  box-shadow: 0 3px 10px rgba(35, 155, 97, .2);
+}
+.save-bar :deep(.save-button.n-button--disabled) {
+  opacity: 1;
+  cursor: not-allowed;
+  color: #65716b !important;
+  background: #252c2a !important;
+  border-color: #303936 !important;
+  box-shadow: none !important;
+}
+.save-bar :deep(.save-button.n-button--disabled .n-button__icon) {
+  color: #65716b !important;
+}
+:global(.theme-light .save-bar .save-button.n-button--disabled) {
+  color: #8d9993 !important;
+  background: #e8eeeb !important;
+  border-color: #d2dbd6 !important;
+}
+:global(.theme-light .save-bar .save-button.n-button--disabled .n-button__icon) {
+  color: #8d9993 !important;
+}
 @media (max-width: 700px) {
   .server-form {
     grid-template-columns: 1fr;
