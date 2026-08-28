@@ -59,6 +59,23 @@ function upload(wrapper: SFTPWrapper, local: string, remote: string): Promise<vo
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const sudo = (password: string, command: string) => `printf '%s\\n' ${quote(password)} | sudo -S -p '' sh -c ${quote(command)}`;
+const controllerSourceFiles = ["index.ts", "db.ts", "nodeDeployment.ts", "proxyHeaders.ts"] as const;
+
+export function resolveControllerSourceRoot(
+  moduleRoot = resolve(fileURLToPath(new URL(".", import.meta.url))),
+  workingDirectory = process.cwd()
+): string | null {
+  const candidates = [
+    moduleRoot,
+    resolve(moduleRoot, "../src"),
+    resolve(workingDirectory, "apps/server/src"),
+    resolve(workingDirectory, "server/src"),
+    resolve(workingDirectory, "resources/server/src")
+  ];
+  return [...new Set(candidates)].find((candidate) =>
+    controllerSourceFiles.every((file) => existsSync(resolve(candidate, file)))
+  ) || null;
+}
 
 export async function deployNode(credentials: ServerCredentials, log: (message:string)=>void = ()=>{}, force=false): Promise<DeploymentResult> {
   log(`正在连接 ${credentials.username}@${credentials.host}:${credentials.port}`);
@@ -105,19 +122,12 @@ export async function deployNode(credentials: ServerCredentials, log: (message:s
 
     log("准备远程部署目录并上传控制中心源码");
     const wrapper = await sftp(client);
-    const moduleRoot = resolve(fileURLToPath(new URL(".", import.meta.url)));
-    const sourceRoot = existsSync(resolve(moduleRoot, "index.ts"))
-      ? moduleRoot
-      : resolve(process.cwd(), "apps/server/src");
-    if (!existsSync(resolve(sourceRoot, "index.ts"))) {
-      throw new Error("找不到主控源码，无法上传节点控制中心");
-    }
+    const sourceRoot = resolveControllerSourceRoot();
+    if (!sourceRoot) throw new Error("安装资源不完整：找不到节点控制中心源码，请重新安装最新版客户端");
     await exec(client, "rm -rf /tmp/nexious-node-deploy && mkdir -p /tmp/nexious-node-deploy/src");
-    await Promise.all([
-      upload(wrapper, resolve(sourceRoot, "index.ts"), "/tmp/nexious-node-deploy/src/index.ts"),
-      upload(wrapper, resolve(sourceRoot, "db.ts"), "/tmp/nexious-node-deploy/src/db.ts"),
-      upload(wrapper, resolve(sourceRoot, "nodeDeployment.ts"), "/tmp/nexious-node-deploy/src/nodeDeployment.ts")
-    ]);
+    await Promise.all(controllerSourceFiles.map((file) =>
+      upload(wrapper, resolve(sourceRoot, file), `/tmp/nexious-node-deploy/src/${file}`)
+    ));
     log("控制中心源码上传完成");
     wrapper.end();
     const selectedPort=8788;
@@ -130,7 +140,7 @@ export async function deployNode(credentials: ServerCredentials, log: (message:s
     });
     const upstream = process.env.RELAY_UPSTREAM || process.env.RELAY_URL || "";
     const httpUpstream = upstream.replace(/^wss:/, "https:").replace(/^ws:/, "http:").replace(/\/$/, "");
-    const service = `[Unit]\nDescription=Nexious Node Controller\nAfter=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory=/opt/nexious-node\nEnvironment=PORT=${selectedPort}\nEnvironment=BIND_HOST=0.0.0.0\nEnvironment=NEXIOUS_DB_PATH=/var/lib/nexious-node/nexious.db\nEnvironment=NEXIOUS_SKIP_SEED=1\nEnvironment=NEXIOUS_ADMIN_TOKEN=${token}\nEnvironment=RELAY_URL=ws://${credentials.host}:${selectedPort}\nEnvironment=RELAY_UPSTREAM=${upstream}\nEnvironment=HTTP_UPSTREAM=${httpUpstream}\nEnvironment=NODE_ENV=production\nExecStart=/usr/bin/env npm start\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n`;
+    const service = `[Unit]\nDescription=Nexious Node Controller\nAfter=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory=/opt/nexious-node\nEnvironment=PORT=${selectedPort}\nEnvironment=BIND_HOST=0.0.0.0\nEnvironment=NEXIOUS_DB_PATH=/var/lib/nexious-node/nexious.db\nEnvironment=NEXIOUS_SKIP_SEED=1\nEnvironment=NEXIOUS_NODE_CONTROLLER=1\nEnvironment=NEXIOUS_ADMIN_TOKEN=${token}\nEnvironment=RELAY_URL=ws://${credentials.host}:${selectedPort}\nEnvironment=RELAY_UPSTREAM=${upstream}\nEnvironment=HTTP_UPSTREAM=${httpUpstream}\nEnvironment=NODE_ENV=production\nExecStart=/usr/bin/env npm start\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n`;
     const setup = [
       "systemctl stop nexious-node 2>/dev/null || true",
       "mkdir -p /opt/nexious-node/src /var/lib/nexious-node /etc/nexious-node",

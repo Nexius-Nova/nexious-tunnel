@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { useQueryClient } from "@tanstack/vue-query";
 import { NButton, NFormItem, NInput, NSwitch, useMessage } from "naive-ui";
 import { MonitorUp, Moon, PanelTopClose, Save, Settings2 } from "lucide-vue-next";
 import type { Preferences } from "../types";
@@ -8,6 +9,7 @@ import PageHeader from "../components/PageHeader.vue";
 import StateBlock from "../components/StateBlock.vue";
 
 const message = useMessage();
+const queryClient = useQueryClient();
 const darkMode = ref(localStorage.getItem("nexious-theme") !== "light");
 const loading = ref(true),
   saving = ref(false);
@@ -51,13 +53,36 @@ onMounted(async () => {
 async function save() {
   saving.value = true;
   try {
+    form.apiUrl = form.apiUrl.trim().replace(/\/+$/, "");
     const value = await invoke<Preferences>("set_desktop_preferences", {
       preferences: { ...form }
     });
     Object.assign(form, value);
     saved.value = { ...value };
+    queryClient.clear();
     message.success("桌面设置已生效");
   } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    saving.value = false;
+  }
+}
+async function updateDesktopPreference(
+  key: "autoStart" | "minimizeToTray",
+  value: boolean
+) {
+  const previous = form[key];
+  form[key] = value;
+  saving.value = true;
+  try {
+    const persisted = await invoke<Preferences>("set_desktop_preferences", {
+      preferences: { ...form }
+    });
+    Object.assign(form, persisted);
+    saved.value = { ...persisted };
+    message.success("设置已保存");
+  } catch (error) {
+    form[key] = previous;
     message.error(error instanceof Error ? error.message : String(error));
   } finally {
     saving.value = false;
@@ -99,7 +124,12 @@ function setTheme(value:boolean) {
             <b>{{ item.title }}</b
             ><span>{{ item.desc }}</span>
           </div>
-          <n-switch v-model:value="form[item.key]" :aria-label="item.title" />
+          <n-switch
+            :value="form[item.key]"
+            :disabled="saving"
+            :aria-label="item.title"
+            @update:value="updateDesktopPreference(item.key, $event)"
+          />
         </div>
       </section>
       <section class="settings-panel server-settings">

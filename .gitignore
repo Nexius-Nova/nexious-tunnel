@@ -13,6 +13,7 @@ release/
 # Tauri generated files
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/resources/
 
 # Runtime data and databases
 data/

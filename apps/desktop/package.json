@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc -b --noEmit && vite build",
     "typecheck": "vue-tsc -b --noEmit",
+    "prepare-runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../scripts/prepare-desktop-runtime.ps1",
     "tauri": "tauri"
   },
   "dependencies": {

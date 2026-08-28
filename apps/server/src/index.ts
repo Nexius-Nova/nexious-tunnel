@@ -1,15 +1,24 @@
 import cors from "cors";
 import express, { type ErrorRequestHandler } from "express";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { db, tunnelRows } from "./db.js";
 import { deployNode, inspectNode } from "./nodeDeployment.js";
+import {
+  hopByHopHeaders,
+  normalizeLocalCookieDomain,
+  normalizePermissionsPolicy,
+  sanitizeForwardedRequestHeaders,
+  sanitizeForwardedWebSocketHeaders
+} from "./proxyHeaders.js";
 
 const app = express();
 const httpServer = createServer(app);
 const port = Number(process.env.PORT || 8787);
+const isNodeController = process.env.NEXIOUS_NODE_CONTROLLER === "1";
 app.set("trust proxy", "loopback");
 const allowedOrigins = new Set(
   (
@@ -26,6 +35,19 @@ app.use(
       callback(null, !origin || allowedOrigins.has(origin))
   })
 );
+// 公网隧道域名可能包含 `/api/*` 路径，必须先按 Host 分流，避免被控制中心鉴权拦截。
+// 此处位于 body parser 之前，以便 POST/PUT 请求可以原样转发。
+app.use((req, res, next) => {
+  const publicMatch = req.originalUrl.match(/^\/public\/([^/?]+)(\/[^?]*)?(\?.*)?$/);
+  if (publicMatch) {
+    const tunnelId = decodeURIComponent(publicMatch[1]);
+    const forwardedPath = `${publicMatch[2] || "/"}${publicMatch[3] || ""}`;
+    return forwardPublicHttp(tunnelId, forwardedPath, req, res, next);
+  }
+  const tunnel = findTunnelByHost(req.headers);
+  if (!tunnel) return next();
+  return forwardPublicHttp(tunnel.id, req.originalUrl || "/", req, res, next);
+});
 app.use(express.json({ limit: "2mb" }));
 app.use("/api", (req, res, next) => {
   if (req.path === "/health" || !process.env.NEXIOUS_ADMIN_TOKEN) return next();
@@ -125,21 +147,100 @@ function domainIsOccupied(
   return Boolean(row);
 }
 
+type TrafficPoint = { timestamp: string; inbound: number; outbound: number };
+type AccessLogRow = {
+  id: number;
+  tunnel_id: string;
+  timestamp: string;
+  client_ip: string;
+  method: string;
+  path: string;
+  status: number;
+  duration: number;
+  bytes: number;
+};
+
+function clientIp(req: express.Request) {
+  const cloudflare = req.headers["cf-connecting-ip"];
+  const realIp = req.headers["x-real-ip"];
+  return String(cloudflare || realIp || req.ip || "unknown").split(",")[0].trim();
+}
+
+function recordObservation(
+  tunnelId: string,
+  ip: string,
+  method: string,
+  path: string,
+  status: number,
+  duration: number,
+  inbound: number,
+  outbound: number
+) {
+  db.prepare(
+    "INSERT INTO access_logs (tunnel_id,timestamp,client_ip,method,path,status,duration,bytes) VALUES (?,?,?,?,?,?,?,?)"
+  ).run(tunnelId, new Date().toISOString(), ip, method, path, status, duration, inbound + outbound);
+  if (inbound || outbound) {
+    db.prepare(
+      `INSERT INTO traffic (tunnel_id,timestamp,inbound,outbound) VALUES (?,strftime('%Y-%m-%dT%H:00:00.000Z','now'),?,?)`
+    ).run(tunnelId, inbound, outbound);
+  }
+}
+
+function configuredNodeControllers() {
+  if (isNodeController) return [];
+  return db.prepare(
+    "SELECT id,controller_url,controller_token FROM nodes WHERE controller_url IS NOT NULL AND controller_token IS NOT NULL AND deploy_status='ready'"
+  ).all() as Array<{ id: string; controller_url: string; controller_token: string }>;
+}
+
+async function fetchNodeJson<T>(
+  node: { controller_url: string; controller_token: string },
+  path: string
+): Promise<T> {
+  const base = node.controller_url.replace(/\/api\/?$/, "").replace(/\/$/, "");
+  const response = await fetch(`${base}${path}`, {
+    headers: { authorization: `Bearer ${node.controller_token}` },
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json() as Promise<T>;
+}
+
 app.get("/api/health", (_req, res) =>
   res.json({ ok: true, version: "1.0.0", time: new Date().toISOString() })
 );
-app.get("/api/dashboard", (_req, res) => {
+app.get("/api/dashboard", async (_req, res) => {
   const tunnels = tunnelRows() as Array<Record<string, unknown>>;
-  const totals = db
+  const localTotals = db
     .prepare(
-      "SELECT COALESCE(SUM(inbound),0) inbound, COALESCE(SUM(outbound),0) outbound FROM traffic"
+      "SELECT COALESCE(SUM(inbound),0) inbound, COALESCE(SUM(outbound),0) outbound FROM traffic WHERE datetime(timestamp) > datetime('now','-24 hours')"
     )
-    .get();
-  const series = db
+    .get() as { inbound: number; outbound: number };
+  const localSeries = db
     .prepare(
-      `SELECT timestamp, SUM(inbound) inbound, SUM(outbound) outbound FROM traffic WHERE timestamp > datetime('now','-24 hours') GROUP BY timestamp ORDER BY timestamp`
+      `SELECT timestamp, SUM(inbound) inbound, SUM(outbound) outbound FROM traffic WHERE datetime(timestamp) > datetime('now','-24 hours') GROUP BY timestamp ORDER BY timestamp`
     )
-    .all();
+    .all() as TrafficPoint[];
+  const nodeResults = await Promise.allSettled(
+    configuredNodeControllers().map((node) =>
+      fetchNodeJson<{ totals: { inbound: number; outbound: number }; series: TrafficPoint[] }>(node, "/api/dashboard")
+    )
+  );
+  const totals = { ...localTotals };
+  const seriesByHour = new Map<string, TrafficPoint>();
+  for (const point of localSeries) seriesByHour.set(point.timestamp, { ...point });
+  for (const result of nodeResults) {
+    if (result.status !== "fulfilled") continue;
+    totals.inbound += Number(result.value.totals.inbound) || 0;
+    totals.outbound += Number(result.value.totals.outbound) || 0;
+    for (const point of result.value.series || []) {
+      const current = seriesByHour.get(point.timestamp) || { timestamp: point.timestamp, inbound: 0, outbound: 0 };
+      current.inbound += Number(point.inbound) || 0;
+      current.outbound += Number(point.outbound) || 0;
+      seriesByHour.set(point.timestamp, current);
+    }
+  }
+  const series = [...seriesByHour.values()].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
   const nodeCount = (
     db
       .prepare("SELECT COUNT(*) count FROM nodes WHERE status='online'")
@@ -197,7 +298,19 @@ app.post("/internal/tunnels/sync", (req, res) => {
     db.prepare("INSERT OR IGNORE INTO nodes (id,name,region,city,latency,load,status,host) VALUES (?,?,?,?,?,?,?,?)")
       .run(nodeId, String(body.tunnel.node_name || nodeId), "默认", "默认", 0, 0, "online", nodeHost);
     db.prepare("UPDATE nodes SET host=?,status='online' WHERE id=?").run(nodeHost, nodeId);
-    db.prepare("INSERT OR REPLACE INTO tunnels (id,name,protocol,local_host,local_port,remote_port,node_id,status,domain,created_at,agent_token,auto_start) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+    db.prepare(`INSERT INTO tunnels (id,name,protocol,local_host,local_port,remote_port,node_id,status,domain,created_at,agent_token,auto_start)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET
+        name=excluded.name,
+        protocol=excluded.protocol,
+        local_host=excluded.local_host,
+        local_port=excluded.local_port,
+        remote_port=excluded.remote_port,
+        node_id=excluded.node_id,
+        status=excluded.status,
+        domain=excluded.domain,
+        agent_token=excluded.agent_token,
+        auto_start=excluded.auto_start`)
       .run(body.tunnel.id, body.tunnel.name, body.tunnel.protocol, body.tunnel.local_host, body.tunnel.local_port, body.tunnel.remote_port, nodeId, body.tunnel.status || "stopped", body.tunnel.domain, body.tunnel.created_at || new Date().toISOString(), body.tunnel.agent_token || null, body.tunnel.auto_start || 0);
   }
   res.json({ ok: true });
@@ -399,14 +512,14 @@ app.delete("/api/nodes/:id", (req, res) => {
   if (!result.changes) return res.status(404).json({ message: "节点不存在" });
   res.status(204).end();
 });
-app.get("/api/logs", (req, res) => {
+app.get("/api/logs", async (req, res) => {
   const query = z
     .object({
       tunnelId: z.string().optional(),
       search: z.string().trim().max(100).optional(),
       status: z.enum(["all", "success", "error"]).default("all"),
       page: z.coerce.number().int().min(1).default(1),
-      pageSize: z.coerce.number().int().min(10).max(100).default(20)
+      pageSize: z.coerce.number().int().min(10).max(5000).default(20)
     })
     .parse(req.query);
   // 仅记录用户访问，不记录前端构建产生的静态资源请求。
@@ -429,19 +542,208 @@ app.get("/api/logs", (req, res) => {
   if (query.status === "success") conditions.push("status<400");
   if (query.status === "error") conditions.push("status>=400");
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const total = (
+  const localTotal = (
     db
       .prepare(`SELECT COUNT(*) count FROM access_logs ${where}`)
       .get(...values) as { count: number }
   ).count;
-  const items = db
+  const candidateLimit = Math.min(query.page * query.pageSize, 5000);
+  const localItems = db
     .prepare(
-      `SELECT * FROM access_logs ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`
+      `SELECT * FROM access_logs ${where} ORDER BY timestamp DESC LIMIT ?`
     )
-    .all(...values, query.pageSize, (query.page - 1) * query.pageSize);
+    .all(...values, candidateLimit) as AccessLogRow[];
+  const nodeQuery = new URLSearchParams({ page: "1", pageSize: String(candidateLimit), status: query.status });
+  if (query.tunnelId) nodeQuery.set("tunnelId", query.tunnelId);
+  if (query.search) nodeQuery.set("search", query.search);
+  const nodeResults = await Promise.allSettled(
+    configuredNodeControllers().map((node) =>
+      fetchNodeJson<{ items: AccessLogRow[]; total: number }>(node, `/api/logs?${nodeQuery}`)
+    )
+  );
+  let total = localTotal;
+  const candidates = [...localItems];
+  for (const result of nodeResults) {
+    if (result.status !== "fulfilled") continue;
+    total += Number(result.value.total) || 0;
+    candidates.push(...(result.value.items || []));
+  }
+  candidates.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+  const offset = (query.page - 1) * query.pageSize;
+  const items = candidates.slice(offset, offset + query.pageSize);
   res.json({ items, total, page: query.page, pageSize: query.pageSize });
 });
-const relay = new WebSocketServer({ server: httpServer, path: "/relay" });
+const relay = new WebSocketServer({ noServer: true });
+const publicWebSockets = new WebSocketServer({
+  noServer: true,
+  handleProtocols: (protocols) => protocols.values().next().value || false
+});
+const publicConnections = new Map<string, {
+  socket: WebSocket;
+  tunnelId: string;
+  path: string;
+  clientIp: string;
+  startedAt: number;
+  inbound: number;
+  outbound: number;
+}>();
+
+function finishPublicWebSocket(id: string, status: number) {
+  const connection = publicConnections.get(id);
+  if (!connection || !publicConnections.delete(id)) return null;
+  recordObservation(
+    connection.tunnelId,
+    connection.clientIp,
+    "WS",
+    connection.path,
+    status,
+    Date.now() - connection.startedAt,
+    connection.inbound,
+    connection.outbound
+  );
+  return connection;
+}
+
+function rawDataLength(data: WebSocket.RawData) {
+  return Array.isArray(data)
+    ? data.reduce((total, item) => total + item.length, 0)
+    : Buffer.from(data as ArrayBuffer).length;
+}
+
+function normalizeHost(value: unknown) {
+  return String(value || "").split(",")[0].trim().split(":")[0].replace(/\.$/, "").toLowerCase();
+}
+
+function findTunnelByHost(headers: IncomingMessage["headers"]) {
+  const hostCandidates = [headers["x-forwarded-host"], headers.host]
+    .map(normalizeHost)
+    .filter(Boolean);
+  const tunnels = db
+    .prepare("SELECT t.id,t.domain,n.host FROM tunnels t JOIN nodes n ON n.id=t.node_id")
+    .all() as Array<{ id: string; domain: string; host: string }>;
+  return tunnels.find((item) =>
+    hostCandidates.includes(normalizeHost(`${item.domain}.${item.host}`))
+  );
+}
+
+function resolvePublicWebSocket(request: IncomingMessage) {
+  const parsed = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  const publicMatch = parsed.pathname.match(/^\/public\/([^/]+)(\/.*)?$/);
+  if (publicMatch) {
+    const path = `${publicMatch[2] || "/"}${parsed.search}`;
+    return { tunnelId: decodeURIComponent(publicMatch[1]), path };
+  }
+  const tunnel = findTunnelByHost(request.headers);
+  return tunnel ? { tunnelId: tunnel.id, path: request.url || "/" } : null;
+}
+
+function rejectWebSocketUpgrade(socket: Duplex, status: number, message: string) {
+  const body = Buffer.from(message);
+  socket.end(
+    `HTTP/1.1 ${status} ${status === 404 ? "Not Found" : "Service Unavailable"}\r\n` +
+    "Content-Type: text/plain; charset=utf-8\r\n" +
+    `Content-Length: ${body.length}\r\nConnection: close\r\n\r\n${message}`
+  );
+}
+
+function websocketTarget(upstream: string, requestUrl: string) {
+  const parsed = new URL(upstream.replace(/^http:/, "ws:").replace(/^https:/, "wss:"));
+  return new URL(requestUrl, `${parsed.protocol}//${parsed.host}`).toString();
+}
+
+function bridgeWebSockets(left: WebSocket, right: WebSocket) {
+  const pending: Array<{ data: WebSocket.RawData; isBinary: boolean }> = [];
+  left.on("message", (data, isBinary) => {
+    if (right.readyState === WebSocket.OPEN) right.send(data, { binary: isBinary });
+    else if (right.readyState === WebSocket.CONNECTING) pending.push({ data, isBinary });
+  });
+  right.on("open", () => {
+    for (const message of pending.splice(0)) right.send(message.data, { binary: message.isBinary });
+  });
+  right.on("message", (data, isBinary) => {
+    if (left.readyState === WebSocket.OPEN) left.send(data, { binary: isBinary });
+  });
+  const close = () => {
+    if (left.readyState < WebSocket.CLOSING) left.close();
+    if (right.readyState < WebSocket.CLOSING) right.close();
+  };
+  left.on("close", close);
+  left.on("error", close);
+  right.on("close", close);
+  right.on("error", close);
+}
+
+function proxyWebSocketToUpstream(request: IncomingMessage, socket: Duplex, head: Buffer, upstream: string) {
+  publicWebSockets.handleUpgrade(request, socket, head, (browserSocket) => {
+    const protocols = String(request.headers["sec-websocket-protocol"] || "")
+      .split(",").map((value) => value.trim()).filter(Boolean);
+    const headers = sanitizeForwardedWebSocketHeaders(request.headers);
+    delete headers["sec-websocket-protocol"];
+    headers["x-forwarded-host"] = request.headers.host || "";
+    const upstreamSocket = new WebSocket(
+      websocketTarget(upstream, request.url || "/"),
+      protocols,
+      { headers }
+    );
+    bridgeWebSockets(browserSocket, upstreamSocket);
+  });
+}
+
+function handlePublicWebSocketUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer) {
+  const upstream = process.env.RELAY_UPSTREAM ||
+    process.env.HTTP_UPSTREAM?.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  if (upstream) return proxyWebSocketToUpstream(request, socket, head, upstream);
+  const resolved = resolvePublicWebSocket(request);
+  if (!resolved) return rejectWebSocketUpgrade(socket, 404, "未找到该域名对应的隧道");
+  const agent = agents.get(resolved.tunnelId);
+  if (!agent || agent.readyState !== WebSocket.OPEN) {
+    return rejectWebSocketUpgrade(socket, 503, "agent 未连接");
+  }
+  publicWebSockets.handleUpgrade(request, socket, head, (browserSocket) => {
+    const id = randomUUID();
+    const connection = {
+      socket: browserSocket,
+      tunnelId: resolved.tunnelId,
+      path: resolved.path,
+      clientIp: String(request.headers["cf-connecting-ip"] || request.socket.remoteAddress || "unknown"),
+      startedAt: Date.now(),
+      inbound: 0,
+      outbound: 0
+    };
+    publicConnections.set(id, connection);
+    const headers = sanitizeForwardedWebSocketHeaders(request.headers);
+    headers["x-forwarded-host"] = request.headers.host || "";
+    headers["x-forwarded-proto"] = "https";
+    headers["x-forwarded-for"] = request.socket.remoteAddress || "";
+    agent.send(JSON.stringify({ type: "ws-open", id, path: resolved.path, headers }));
+    browserSocket.on("message", (data, isBinary) => {
+      if (agent.readyState === WebSocket.OPEN) {
+        connection.outbound += rawDataLength(data);
+        agent.send(JSON.stringify({
+          type: "ws-data",
+          id,
+          binary: isBinary,
+          data: Buffer.from(data as Buffer).toString("base64")
+        }));
+      }
+    });
+    browserSocket.on("close", (code, reason) => {
+      if (!finishPublicWebSocket(id, 101) || agent.readyState !== WebSocket.OPEN) return;
+      agent.send(JSON.stringify({ type: "ws-close", id, code, reason: reason.toString() }));
+    });
+    browserSocket.on("error", () => browserSocket.close());
+  });
+}
+
+httpServer.on("upgrade", (request, socket, head) => {
+  const pathname = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`).pathname;
+  if (pathname === "/relay") {
+    relay.handleUpgrade(request, socket, head, (webSocket) => relay.emit("connection", webSocket, request));
+  } else {
+    handlePublicWebSocketUpgrade(request, socket, head);
+  }
+});
+
 relay.on("connection", (socket, request) => {
   const upstream = process.env.RELAY_UPSTREAM;
   if (upstream) {
@@ -469,12 +771,37 @@ relay.on("connection", (socket, request) => {
   socket.on("message", (raw) => {
     try {
       const message = JSON.parse(raw.toString());
+      if (message.type === "ws-data" || message.type === "ws-close") {
+        const connection = publicConnections.get(message.id);
+        if (!connection) return;
+        if (message.type === "ws-data" && connection.socket.readyState === WebSocket.OPEN) {
+          connection.inbound += Buffer.from(message.data || "", "base64").length;
+          connection.socket.send(Buffer.from(message.data || "", "base64"), { binary: Boolean(message.binary) });
+        } else if (message.type === "ws-close") {
+          finishPublicWebSocket(message.id, 101);
+          connection.socket.close(Number(message.code) || 1011, String(message.reason || ""));
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({
+              type: "ws-close",
+              id: message.id,
+              code: Number(message.code) || 1011,
+              reason: String(message.reason || "")
+            }));
+          }
+        }
+        return;
+      }
       pending.get(message.id)?.(message);
       pending.delete(message.id);
     } catch {}
   });
   socket.on("close", () => {
     if (agents.get(tunnelId) === socket) agents.delete(tunnelId);
+    for (const [id, connection] of publicConnections) {
+      if (connection.tunnelId !== tunnelId) continue;
+      finishPublicWebSocket(id, 503);
+      connection.socket.close(1012, "agent disconnected");
+    }
     db.prepare(
       "UPDATE tunnels SET status='stopped' WHERE id=? AND status='running'"
     ).run(tunnelId);
@@ -489,18 +816,7 @@ function forwardToAgent(
 ) {
   const socket = agents.get(tunnelId);
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    db.prepare(
-      "INSERT INTO access_logs (tunnel_id,timestamp,client_ip,method,path,status,duration,bytes) VALUES (?,?,?,?,?,?,?,?)"
-    ).run(
-      tunnelId,
-      new Date().toISOString(),
-      req.ip || "unknown",
-      req.method,
-      forwardedPath,
-      503,
-      0,
-      0
-    );
+    recordObservation(tunnelId, clientIp(req), req.method, forwardedPath, 503, 0, 0, 0);
     return res.status(503).json({ message: "agent 未连接" });
   }
   const id = randomUUID(),
@@ -510,18 +826,7 @@ function forwardToAgent(
   req.on("end", () => {
     const timer = setTimeout(() => {
       if (pending.delete(id) && !res.headersSent) {
-        db.prepare(
-          "INSERT INTO access_logs (tunnel_id,timestamp,client_ip,method,path,status,duration,bytes) VALUES (?,?,?,?,?,?,?,?)"
-        ).run(
-          tunnelId,
-          new Date().toISOString(),
-          req.ip || "unknown",
-          req.method,
-          forwardedPath,
-          504,
-          Date.now() - startedAt,
-          0
-        );
+        recordObservation(tunnelId, clientIp(req), req.method, forwardedPath, 504, Date.now() - startedAt, 0, Buffer.concat(chunks).length);
         res.status(504).json({ message: "agent 响应超时" });
       }
     }, 30000);
@@ -530,32 +835,26 @@ function forwardToAgent(
       const status = Number(message.status) || 502,
         responseBody = Buffer.from(message.body || "", "base64"),
         requestBytes = Buffer.concat(chunks).length;
-      db.prepare(
-        "INSERT INTO access_logs (tunnel_id,timestamp,client_ip,method,path,status,duration,bytes) VALUES (?,?,?,?,?,?,?,?)"
-      ).run(
-        tunnelId,
-        new Date().toISOString(),
-        req.ip || "unknown",
-        req.method,
-        forwardedPath,
-        status,
-        Date.now() - startedAt,
-        responseBody.length
-      );
-      db.prepare(
-        `INSERT INTO traffic (tunnel_id,timestamp,inbound,outbound) VALUES (?,strftime('%Y-%m-%dT%H:00:00.000Z','now'),?,?)`
-      ).run(tunnelId, responseBody.length, requestBytes);
+      recordObservation(tunnelId, clientIp(req), req.method, forwardedPath, status, Date.now() - startedAt, responseBody.length, requestBytes);
       res.status(status);
       for (const [key, value] of Object.entries(message.headers || {})) {
-        if (typeof value !== "string") continue;
+        const normalizedKey = key.toLowerCase();
+        if (hopByHopHeaders.has(normalizedKey) || normalizedKey === "content-length") continue;
+        const values = (Array.isArray(value) ? value : [value]).filter(
+          (item): item is string => typeof item === "string"
+        );
+        if (!values.length) continue;
         // 目标服务可能返回仅允许 localhost 的 CORS 头，经过隧道后应匹配当前公网来源。
-        if (
-          key.toLowerCase() === "access-control-allow-origin" &&
-          req.headers.origin
-        ) {
+        if (normalizedKey === "access-control-allow-origin" && req.headers.origin) {
           res.setHeader(key, req.headers.origin);
+        } else if (normalizedKey === "set-cookie") {
+          // 本地服务常把 Cookie 绑定到 localhost；移除该 Domain 后，浏览器会自动绑定当前隧道域名。
+          res.setHeader(key, values.map(normalizeLocalCookieDomain));
+        } else if (normalizedKey === "permissions-policy") {
+          const policy = normalizePermissionsPolicy(values.join(","));
+          if (policy) res.setHeader(key, policy);
         } else {
-          res.setHeader(key, value);
+          res.setHeader(key, values.length === 1 ? values[0] : values);
         }
       }
       res.end(responseBody);
@@ -563,11 +862,10 @@ function forwardToAgent(
     // 浏览器访问隧道域名时会携带该公网域名的 Origin。直接转发会触发
     // Vite/后端的跨域白名单校验；隧道本身已经是同源代理，因此清理跨域
     // 标识，让本地服务按普通同源请求处理。
-    const forwardedHeaders = { ...req.headers };
-    delete forwardedHeaders.origin;
-    delete forwardedHeaders.referer;
+    const forwardedHeaders = sanitizeForwardedRequestHeaders(req.headers);
     forwardedHeaders["x-forwarded-host"] = req.headers.host || "";
     forwardedHeaders["x-forwarded-proto"] = req.protocol;
+    forwardedHeaders["x-forwarded-for"] = req.ip || "";
     socket.send(
       JSON.stringify({
         id,
@@ -581,6 +879,68 @@ function forwardToAgent(
   req.on("error", next);
 }
 
+function requestBody(req: express.Request): Promise<Buffer> {
+  if (req.readableEnded) {
+    if (req.body === undefined) return Promise.resolve(Buffer.alloc(0));
+    if (Buffer.isBuffer(req.body)) return Promise.resolve(req.body);
+    if (typeof req.body === "string") return Promise.resolve(Buffer.from(req.body));
+    return Promise.resolve(Buffer.from(JSON.stringify(req.body)));
+  }
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+async function proxyHttpToUpstream(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+  upstream: string,
+  forwardedPath: string
+) {
+  try {
+    const target = `${upstream.replace(/\/$/, "")}${forwardedPath}`;
+    const headers = new Headers(req.headers as HeadersInit);
+    for (const name of [...hopByHopHeaders, "host", "content-length"]) headers.delete(name);
+    headers.set("x-forwarded-host", req.headers.host || "");
+    headers.set("x-forwarded-proto", req.protocol);
+    headers.set("x-forwarded-for", req.ip || "");
+    const body = ["GET", "HEAD"].includes(req.method) ? undefined : await requestBody(req);
+    const response = await fetch(target, { method: req.method, headers, body });
+    res.status(response.status);
+    response.headers.forEach((value, key) => {
+      const normalizedKey = key.toLowerCase();
+      if (hopByHopHeaders.has(normalizedKey) || normalizedKey === "content-length" || normalizedKey === "set-cookie") return;
+      if (normalizedKey === "permissions-policy") {
+        const policy = normalizePermissionsPolicy(value);
+        if (policy) res.setHeader(key, policy);
+      } else if (normalizedKey === "access-control-allow-origin" && req.headers.origin) {
+        res.setHeader(key, req.headers.origin);
+      } else res.setHeader(key, value);
+    });
+    const cookies = (response.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie?.();
+    if (cookies?.length) res.setHeader("set-cookie", cookies.map(normalizeLocalCookieDomain));
+    res.end(Buffer.from(await response.arrayBuffer()));
+  } catch (error) {
+    next(error);
+  }
+}
+
+function forwardPublicHttp(
+  tunnelId: string,
+  forwardedPath: string,
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const upstream = process.env.HTTP_UPSTREAM;
+  if (upstream) return proxyHttpToUpstream(req, res, next, upstream, forwardedPath);
+  return forwardToAgent(tunnelId, forwardedPath, req, res, next);
+}
+
 app.use("/public/:tunnelId", (req, res, next) => {
   const path =
     req.originalUrl.replace(`/public/${req.params.tunnelId}`, "") || "/";
@@ -588,27 +948,8 @@ app.use("/public/:tunnelId", (req, res, next) => {
 });
 app.use((req, res, next) => {
   const upstream = process.env.HTTP_UPSTREAM;
-  if (upstream) {
-    const target = `${upstream.replace(/\/$/, "")}${req.originalUrl || "/"}`;
-    const headers = new Headers(req.headers as HeadersInit);
-    ["connection", "upgrade", "keep-alive", "transfer-encoding", "te", "trailer", "proxy-authorization", "proxy-authenticate"].forEach(header => headers.delete(header));
-    headers.set("x-forwarded-host", req.headers.host || "");
-    return fetch(target, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body) })
-      .then(async response => { res.status(response.status); response.headers.forEach((value,key)=>{ if(!["content-length","transfer-encoding","connection"].includes(key.toLowerCase())) res.setHeader(key,value); }); res.send(Buffer.from(await response.arrayBuffer())); })
-      .catch(() => res.status(502).json({ message: "边缘入口无法连接主 Relay" }));
-  }
-  const normalizeHost = (value: unknown) => String(value || "").split(",")[0].trim().split(":")[0].replace(/\.$/, "").toLowerCase();
-  const hostCandidates = [req.headers["x-forwarded-host"], req.headers.host, req.hostname]
-    .map(normalizeHost)
-    .filter(Boolean);
-  const tunnel = db
-    .prepare(
-      `
-    SELECT t.id, t.domain, n.host FROM tunnels t JOIN nodes n ON n.id=t.node_id
-  `
-    )
-    .all() as Array<{ id: string; domain: string; host: string }>;
-  const matchedTunnel = tunnel.find((item) => hostCandidates.includes(normalizeHost(`${item.domain}.${item.host}`)));
+  if (upstream) return proxyHttpToUpstream(req, res, next, upstream, req.originalUrl || "/");
+  const matchedTunnel = findTunnelByHost(req.headers);
   if (!matchedTunnel)
     return res.status(404).json({ message: "未找到该域名对应的隧道" });
   return forwardToAgent(matchedTunnel.id, req.originalUrl || "/", req, res, next);

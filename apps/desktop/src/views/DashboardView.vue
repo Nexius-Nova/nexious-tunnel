@@ -41,10 +41,17 @@ const router = useRouter(),
     refetchInterval: 15000
   });
 
-const bytes = (value: number = 0) =>
-  value > 1e9
-    ? `${(value / 1e9).toFixed(1)} GB`
-    : `${(value / 1e6).toFixed(1)} MB`;
+const bytes = (value: number = 0) => {
+  if (value < 1024) return `${Math.round(value)} B`;
+  if (value < 1e6) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1e9) return `${(value / 1e6).toFixed(1)} MB`;
+  return `${(value / 1e9).toFixed(1)} GB`;
+};
+const hasTrafficData = computed(() =>
+  (dashboard.data.value?.series || []).some(
+    (point) => Number(point.inbound) > 0 || Number(point.outbound) > 0
+  )
+);
 const extractDomain = (url: string) => {
   try {
     return new URL(url).hostname;
@@ -95,20 +102,7 @@ const option = computed(() => ({
       smooth: 0.35,
       symbol: "none",
       data: (dashboard.data.value?.series || []).map((p) => p.inbound),
-      lineStyle: { color: "#39d98a", width: 2 },
-      areaStyle: {
-        color: {
-          type: "linear",
-          x: 0,
-          y: 0,
-          x2: 0,
-          y2: 1,
-          colorStops: [
-            { offset: 0, color: "rgba(57,217,138,.18)" },
-            { offset: 1, color: "rgba(57,217,138,.01)" }
-          ]
-        }
-      }
+      lineStyle: { color: "#39d98a", width: 2 }
     },
     {
       name: "上传",
@@ -116,20 +110,7 @@ const option = computed(() => ({
       smooth: 0.35,
       symbol: "none",
       data: (dashboard.data.value?.series || []).map((p) => p.outbound),
-      lineStyle: { color: "#f3b44d", width: 2 },
-      areaStyle: {
-        color: {
-          type: "linear",
-          x: 0,
-          y: 0,
-          x2: 0,
-          y2: 1,
-          colorStops: [
-            { offset: 0, color: "rgba(243,180,77,.12)" },
-            { offset: 1, color: "rgba(243,180,77,.01)" }
-          ]
-        }
-      }
+      lineStyle: { color: "#f3b44d", width: 2 }
     }
   ]
 }));
@@ -151,7 +132,8 @@ const params = computed(() => ({
 }));
 const logs = useQuery({
   queryKey: computed(() => ["logs", params.value]),
-  queryFn: () => api.logs(params.value)
+  queryFn: () => api.logs(params.value),
+  refetchInterval: 15000
 });
 const tunnelOptions = computed(() => [
   { label: "全部隧道", value: "all" },
@@ -310,7 +292,12 @@ const logColumns: DataTableColumns<AccessLog> = [
               <i class="download"></i>下载<i class="upload"></i>上传
             </div>
           </div>
-          <v-chart class="chart" :option="option" autoresize />
+          <v-chart v-if="hasTrafficData" class="chart" :option="option" autoresize />
+          <div v-else class="chart-empty">
+            <Activity :size="22" />
+            <b>暂无流量数据</b>
+            <span>隧道产生请求后，网络流量会显示在这里</span>
+          </div>
         </section>
 
         <!-- Connections -->
@@ -464,21 +451,24 @@ const logColumns: DataTableColumns<AccessLog> = [
   gap: 16px;
   margin-bottom: 20px;
 }
-.metric-card {
+.metrics > .metric-card {
   display: flex;
   align-items: flex-start;
   gap: 14px;
   padding: 20px;
-  border: 1px solid var(--border, #292f32);
-  background: var(--surface, #15191b);
-  border-radius: 8px;
+  border: 0;
+  border-right: 1px solid var(--border, #292f32);
+  background: transparent;
+  border-radius: 0;
   transition:
     border-color 0.2s,
     box-shadow 0.2s;
 }
-.metric-card:hover {
-  border-color: #353d40;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
+.metrics > .metric-card:last-child {
+  border-right: 0;
+}
+.metrics > .metric-card:hover {
+  background: var(--surface-raised, #1b2123);
 }
 .metric-icon {
   width: 42px;
@@ -558,6 +548,26 @@ const logColumns: DataTableColumns<AccessLog> = [
 }
 .chart {
   height: 260px;
+}
+.chart-empty {
+  height: 260px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-muted, #69736f);
+}
+.chart-empty svg {
+  color: var(--accent, #39d98a);
+  opacity: 0.75;
+}
+.chart-empty b {
+  color: var(--text-secondary, #89938f);
+  font-size: 13px;
+}
+.chart-empty span {
+  font-size: 11px;
 }
 
 /* ── Connection ── */
@@ -655,13 +665,12 @@ const logColumns: DataTableColumns<AccessLog> = [
 }
 
 /* ── Light Theme ── */
-.theme-light .metric-card {
+.theme-light .metrics > .metric-card {
   background: #fff;
-  border-color: #d8dedb;
+  border-right-color: #e1e6e3;
 }
-.theme-light .metric-card:hover {
-  border-color: #cdd6d1;
-  box-shadow: 0 2px 8px rgba(20, 32, 26, 0.06);
+.theme-light .metrics > .metric-card:hover {
+  background: #f8faf9;
 }
 .theme-light .metric-green .metric-icon {
   background: #e6f5ec;
@@ -682,6 +691,9 @@ const logColumns: DataTableColumns<AccessLog> = [
 .theme-light .chart-section {
   background: #fff;
   border-color: #d8dedb;
+}
+.theme-light .chart-empty b {
+  color: #52605a;
 }
 .theme-light .conn-copy {
   color: #52605a !important;
