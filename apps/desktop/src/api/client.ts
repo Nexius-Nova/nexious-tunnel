@@ -41,6 +41,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 }
 export const api = {
+  health: () => request<{ ok: boolean }>("/api/health"),
   dashboard: () => request<Dashboard>("/api/dashboard"),
   tunnels: () => request<Tunnel[]>("/api/tunnels"),
   nodes: () => request<NodeInfo[]>("/api/nodes"),

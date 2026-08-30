@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  node:
+    name: Server & Frontend (typecheck / build / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Server typecheck + build + tests
+        run: |
+          pnpm --filter @nexious/server typecheck
+          pnpm --filter @nexious/server build
+          pnpm --filter @nexious/server test
+      - name: Agent typecheck
+        run: pnpm --filter @nexious/agent typecheck
+      - name: Desktop frontend typecheck + build
+        run: |
+          pnpm --filter @nexious/desktop typecheck
+          pnpm --filter @nexious/desktop exec vite build
+
+  desktop-rust:
+    name: Desktop Rust (cargo test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # generate_context! 需要读取 frontendDist，先构建前端产物
+      - run: pnpm --filter @nexious/desktop exec vite build
+      - name: Cargo test
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml

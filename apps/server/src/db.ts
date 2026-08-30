@@ -64,6 +64,19 @@ const nodeColumns = [
 for (const [name, definition] of nodeColumns) {
   try { db.exec(`ALTER TABLE nodes ADD COLUMN ${name} ${definition}`); } catch { /* existing database */ }
 }
+// 访问日志/流量表是高频写入的热点，缺索引会让 /api/logs 的过滤查询随数据量线性劣化。
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs(timestamp DESC);
+  CREATE INDEX IF NOT EXISTS idx_access_logs_tunnel ON access_logs(tunnel_id, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_traffic_timestamp ON traffic(timestamp);
+`);
+// 日志与流量只写不删会让数据库无限膨胀；由服务端定期调用清理。
+export function pruneOldData() {
+  const retentionDays = Number(process.env.NEXIOUS_LOG_RETENTION_DAYS || 30);
+  const trafficDays = Number(process.env.NEXIOUS_TRAFFIC_RETENTION_DAYS || 90);
+  db.prepare("DELETE FROM access_logs WHERE timestamp < datetime('now', ?)").run(`-${retentionDays} days`);
+  db.prepare("DELETE FROM traffic WHERE timestamp < datetime('now', ?)").run(`-${trafficDays} days`);
+}
 db.exec(
   "UPDATE nodes SET host=lower(rtrim(replace(replace(host,'https://',''),'http://',''),'/')) WHERE host LIKE 'http://%' OR host LIKE 'https://%'"
 );
@@ -136,27 +149,27 @@ function seed() {
       created_at: now
     },
     {
-      id: "tun-ssh",
-      name: "工作站 SSH",
-      protocol: "tcp",
-      local_host: "192.168.1.10",
-      local_port: 22,
-      remote_port: 31022,
+      id: "tun-api",
+      name: "测试环境 API",
+      protocol: "https",
+      local_host: "127.0.0.1",
+      local_port: 4000,
+      remote_port: 443,
       node_id: "n-hk-01",
       status: "running",
-      domain: null,
+      domain: "api",
       created_at: now
     },
     {
-      id: "tun-nas",
-      name: "家庭 NAS",
-      protocol: "tcp",
-      local_host: "192.168.1.8",
-      local_port: 5000,
-      remote_port: 35000,
+      id: "tun-admin",
+      name: "内部管理后台",
+      protocol: "http",
+      local_host: "127.0.0.1",
+      local_port: 3000,
+      remote_port: 80,
       node_id: "n-sh-01",
       status: "stopped",
-      domain: null,
+      domain: "admin",
       created_at: now
     }
   ].forEach((row) => insertTunnel.run(row));
@@ -175,7 +188,7 @@ function seed() {
       900000 + Math.round(Math.random() * 2600000)
     );
     traffic.run(
-      "tun-ssh",
+      "tun-api",
       time,
       400000 + Math.round(Math.random() * 900000),
       250000 + Math.round(Math.random() * 600000)

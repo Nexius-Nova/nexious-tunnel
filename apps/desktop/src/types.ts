@@ -68,6 +68,9 @@ export interface Preferences {
   minimizeToTray: boolean;
   apiUrl: string;
   apiToken: string;
+  maxBodyMb: number;
+  logRetentionDays: number;
+  trafficRetentionDays: number;
 }
 export interface TunnelInput {
   name: string;

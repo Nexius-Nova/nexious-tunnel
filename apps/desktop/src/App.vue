@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useQuery } from "@tanstack/vue-query";
+import { invoke } from "@tauri-apps/api/core";
 import {
   NConfigProvider,
   NDialogProvider,
@@ -29,6 +31,7 @@ import {
 } from "lucide-vue-next";
 import { useRoute, useRouter } from "vue-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { api } from "./api/client";
 
 const collapsed = ref(false),
   route = useRoute(),
@@ -73,6 +76,27 @@ async function onTitlebarDown(e: MouseEvent) {
 
 const icon = (component: unknown) => () =>
   h(NIcon, null, { default: () => h(component as never) });
+// 侧栏控制中心状态：真实轮询健康检查，不再硬编码“在线”文案。
+const controlCenterHost = ref("127.0.0.1:8787");
+const healthQuery = useQuery({
+  queryKey: ["control-center-health"],
+  queryFn: () => api.health(),
+  refetchInterval: 15000,
+  retry: false,
+  staleTime: 10000
+});
+const controlOnline = computed(() => healthQuery.data.value?.ok === true);
+onMounted(async () => {
+  try {
+    const preferences = await invoke<{ apiUrl?: string; api_url?: string }>(
+      "get_desktop_preferences"
+    );
+    const apiUrl = preferences.apiUrl ?? preferences.api_url ?? "";
+    if (apiUrl) controlCenterHost.value = apiUrl.replace(/^https?:\/\//, "");
+  } catch {
+    // 浏览器开发环境没有 Tauri IPC，保留默认展示
+  }
+});
 const menu: MenuOption[] = [
   { label: "隧道管理", key: "/tunnels", icon: icon(Cable) },
   { label: "边缘节点", key: "/nodes", icon: icon(MapPin) },
@@ -189,9 +213,16 @@ watch(
                 >
                   <ChevronLeft :size="17" :class="{ flip: collapsed }" />
                 </button>
-                <div v-if="!collapsed" class="daemon">
+                <div
+                  v-if="!collapsed"
+                  class="daemon"
+                  :class="{ offline: !controlOnline }"
+                >
                   <i></i>
-                  <div><b>本地服务在线</b><span>127.0.0.1:8787</span></div>
+                  <div>
+                    <b>{{ controlOnline ? "控制中心在线" : "控制中心离线" }}</b>
+                    <span>{{ controlCenterHost }}</span>
+                  </div>
                   <Activity :size="16" />
                 </div>
               </n-layout-sider>

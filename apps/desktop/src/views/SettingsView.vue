@@ -2,8 +2,8 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useQueryClient } from "@tanstack/vue-query";
-import { NButton, NFormItem, NInput, NSwitch, useMessage } from "naive-ui";
-import { MonitorUp, Moon, PanelTopClose, Save, Settings2 } from "lucide-vue-next";
+import { NButton, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from "naive-ui";
+import { MonitorUp, Moon, PanelTopClose, Save } from "lucide-vue-next";
 import type { Preferences } from "../types";
 import PageHeader from "../components/PageHeader.vue";
 import StateBlock from "../components/StateBlock.vue";
@@ -17,7 +17,10 @@ const form = reactive<Preferences>({
   autoStart: false,
   minimizeToTray: true,
   apiUrl: "http://127.0.0.1:8787",
-  apiToken: ""
+  apiToken: "",
+  maxBodyMb: 25,
+  logRetentionDays: 30,
+  trafficRetentionDays: 90
 });
 const saved = ref<Preferences>({ ...form });
 const changed = computed(
@@ -104,13 +107,6 @@ function setTheme(value:boolean) {
     />
     <StateBlock v-if="loading" loading />
     <template v-else>
-      <section class="settings-summary">
-        <div class="summary-icon"><Settings2 /></div>
-        <div>
-          <b>桌面集成</b><span>这些设置仅作用于当前设备，保存后立即生效。</span>
-        </div>
-        <i>WINDOWS</i>
-      </section>
       <section class="settings-panel">
         <h2>桌面偏好</h2>
         <div class="setting-row">
@@ -132,6 +128,44 @@ function setTheme(value:boolean) {
           />
         </div>
       </section>
+      <section class="settings-panel">
+        <h2>本地服务</h2>
+        <p class="section-description">作用于本机内置的控制中心服务，保存后自动重启生效。</p>
+        <div class="setting-row">
+          <div><b>隧道请求体上限</b><span>超过上限的请求返回 413，1 - 1024 MB</span></div>
+          <n-input-number
+            v-model:value="form.maxBodyMb"
+            class="number-input"
+            :min="1"
+            :max="1024"
+            :step="5"
+            :disabled="saving"
+            aria-label="隧道请求体上限"
+          ><template #suffix>MB</template></n-input-number>
+        </div>
+        <div class="setting-row">
+          <div><b>访问日志保留天数</b><span>后台自动清理过期日志</span></div>
+          <n-input-number
+            v-model:value="form.logRetentionDays"
+            class="number-input"
+            :min="1"
+            :max="3650"
+            :disabled="saving"
+            aria-label="访问日志保留天数"
+          ><template #suffix>天</template></n-input-number>
+        </div>
+        <div class="setting-row">
+          <div><b>流量统计保留天数</b><span>后台自动清理过期流量记录</span></div>
+          <n-input-number
+            v-model:value="form.trafficRetentionDays"
+            class="number-input"
+            :min="1"
+            :max="3650"
+            :disabled="saving"
+            aria-label="流量统计保留天数"
+          ><template #suffix>天</template></n-input-number>
+        </div>
+      </section>
       <section class="settings-panel server-settings">
         <h2>主控制中心</h2>
         <p class="section-description">用于读取和管理全部边缘节点及隧道。每个节点的独立连接凭据在“边缘节点”页面维护。</p>
@@ -150,124 +184,83 @@ function setTheme(value:boolean) {
           /></n-form-item>
         </div>
       </section>
-      <div class="save-bar">
-        <span>{{ changed ? "有尚未保存的更改" : "所有设置均已保存" }}</span>
-        <n-button
-          class="save-button"
-          type="primary"
-          :disabled="!changed"
-          :loading="saving"
-          @click="save"
+    </template>
+    <transition name="save-pill">
+      <div v-if="changed" class="save-pill">
+        <span>有未保存的更改</span>
+        <n-button type="primary" :loading="saving" @click="save"
           ><template #icon><Save /></template>保存设置</n-button
         >
       </div>
-    </template>
+    </transition>
   </div>
 </template>
 
 <style scoped>
-.settings-summary {
+/* 悬浮保存按钮：仅在存在未保存更改时出现，任何滚动位置都可见，保存后消失 */
+.save-pill {
+  position: fixed;
+  right: 32px;
+  bottom: 24px;
+  z-index: 40;
   display: flex;
   align-items: center;
-  gap: 14px;
-  margin-bottom: 16px;
-  padding: 16px 18px;
-  border: 1px solid rgba(35, 155, 97, 0.18);
-  border-radius: 8px;
-  background: rgba(35, 155, 97, 0.06);
+  gap: 12px;
+  padding: 10px 12px 10px 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: #1a201f;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
 }
-.summary-icon {
-  width: 40px;
-  height: 40px;
-  display: grid;
-  place-items: center;
-  border: 1px solid rgba(57, 217, 138, 0.28);
-  border-radius: 6px;
-  color: #39d98a;
-  background: rgba(35, 155, 97, 0.08);
+.save-pill span {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
-.summary-icon svg {
-  width: 18px;
+.save-pill-enter-active,
+.save-pill-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
 }
-.settings-summary > div:nth-child(2) {
-  flex: 1;
-  min-width: 0;
+.save-pill-enter-from,
+.save-pill-leave-to {
+  opacity: 0;
+  transform: translateY(10px);
 }
-.settings-summary b,
-.settings-summary span {
-  display: block;
+:global(.theme-light) .save-pill {
+  background: #ffffff;
+  border-color: #d8dedb;
+  box-shadow: 0 10px 28px rgba(20, 32, 26, 0.14);
 }
-.settings-summary b {
-  font-size: 13px;
+@media (max-width: 700px) {
+  .save-pill {
+    right: 16px;
+    bottom: 84px;
+  }
 }
-.settings-summary span {
-  margin-top: 4px;
-  color: #74807a;
-  font-size: 11px;
+/* 紧凑行高，整页控制在一屏内 */
+.settings-view :deep(.setting-row) {
+  min-height: 0;
+  padding: 12px 18px;
 }
-.settings-summary > i {
-  font: 500 10px "IBM Plex Mono";
-  font-style: normal;
-  letter-spacing: 1.5px;
-  color: #39d98a;
+.settings-view :deep(.settings-panel h2) {
+  padding: 12px 18px 10px;
 }
 .server-form {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
-  padding: 18px 20px;
+  padding: 6px 18px 16px;
 }
 .server-form :deep(.n-form-item) {
   margin: 0;
 }
-.section-description{margin:0;padding:14px 20px 0;color:var(--text-secondary);font-size:12px}
-.save-bar :deep(.save-button) {
-  min-width: 132px;
-  height: 40px;
-  padding: 0 18px;
-  border-radius: 7px;
-  font-weight: 600;
-  transition: background-color .2s ease, border-color .2s ease, color .2s ease, box-shadow .2s ease;
-}
-.save-bar :deep(.save-button:not(.n-button--disabled):hover) {
-  box-shadow: 0 3px 10px rgba(35, 155, 97, .2);
-}
-.save-bar :deep(.save-button.n-button--disabled) {
-  opacity: 1;
-  cursor: not-allowed;
-  color: #65716b !important;
-  background: #252c2a !important;
-  border-color: #303936 !important;
-  box-shadow: none !important;
-}
-.save-bar :deep(.save-button.n-button--disabled .n-button__icon) {
-  color: #65716b !important;
-}
-:global(.theme-light .save-bar .save-button.n-button--disabled) {
-  color: #8d9993 !important;
-  background: #e8eeeb !important;
-  border-color: #d2dbd6 !important;
-}
-:global(.theme-light .save-bar .save-button.n-button--disabled .n-button__icon) {
-  color: #8d9993 !important;
-}
+.section-description{margin:0;padding:12px 18px 0;color:var(--text-secondary);font-size:12px}
+.settings-panel .setting-row > div{flex:1;min-width:0}
+.settings-panel .setting-row > div b{display:block;font-size:13px}
+.settings-panel .setting-row > div span{display:block;margin-top:3px;color:var(--text-secondary);font-size:11px}
+.number-input{width:150px}
 @media (max-width: 700px) {
   .server-form {
     grid-template-columns: 1fr;
-  }
-  .settings-summary > i {
-    display: none;
-  }
-  .settings-summary {
-    align-items: flex-start;
-  }
-  .save-bar {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .save-bar :deep(.n-button) {
-    width: 100%;
   }
 }
 </style>

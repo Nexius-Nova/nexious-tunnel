@@ -22,10 +22,9 @@ const queryClient = new QueryClient({
 const app = createApp(App);
 app.use(router).use(VueQueryPlugin, { queryClient });
 router.isReady().then(() => {
-  app.mount("#app");
+  // 启动页位于 #app 之外，可在 Vue 挂载期间继续覆盖页面，实现平滑过渡
   const splash = document.getElementById("splash");
-  if (splash) {
-    splash.classList.add("fade-out");
-    setTimeout(() => splash.remove(), 500);
-  }
+  splash?.classList.add("fade-out");
+  app.mount("#app");
+  if (splash) setTimeout(() => splash.remove(), 500);
 });

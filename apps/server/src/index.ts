@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
-import { db, tunnelRows } from "./db.js";
+import { db, pruneOldData, tunnelRows } from "./db.js";
 import { deployNode, inspectNode } from "./nodeDeployment.js";
 import {
   hopByHopHeaders,
@@ -14,6 +14,12 @@ import {
   sanitizeForwardedRequestHeaders,
   sanitizeForwardedWebSocketHeaders
 } from "./proxyHeaders.js";
+import {
+  normalizeHost,
+  originAllowed,
+  resolveClientIp,
+  tunnelHostCandidates
+} from "./util.js";
 
 const app = express();
 const httpServer = createServer(app);
@@ -29,10 +35,37 @@ const allowedOrigins = new Set(
     .map((origin) => origin.trim())
     .filter(Boolean)
 );
+// 仅在确认部署在 Cloudflare/反代之后时开启（NEXIOUS_TRUST_PROXY_HEADERS=1），
+// 否则直连客户端可以通过 cf-connecting-ip / x-real-ip 伪造访问日志来源。
+const trustProxyHeaders = process.env.NEXIOUS_TRUST_PROXY_HEADERS === "1";
+const clientIp = (req: express.Request) =>
+  resolveClientIp(req.headers, req.ip, trustProxyHeaders);
+// 公网隧道转发的请求/响应体在内存中整包缓冲，必须限制上限防止内存耗尽。
+const maxBodyBytes = Number(process.env.NEXIOUS_MAX_BODY_MB || 25) * 1024 * 1024;
+
+function applyPublicCors(req: express.Request, res: express.Response) {
+  const origin = req.headers.origin;
+  if (!origin) return;
+  // 公网隧道允许任意来源的匿名跨域访问；不带 credentials，浏览器同源策略对
+  // Cookie 类凭据的保护保持有效。
+  res.setHeader("access-control-allow-origin", origin);
+  res.setHeader("vary", "Origin");
+  res.setHeader(
+    "access-control-allow-methods",
+    req.headers["access-control-request-method"] || "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS"
+  );
+  res.setHeader(
+    "access-control-allow-headers",
+    req.headers["access-control-request-headers"] || "content-type, authorization, x-requested-with"
+  );
+  res.setHeader("access-control-max-age", "86400");
+}
+
 app.use(
   cors({
-    origin: (origin, callback) =>
-      callback(null, !origin || allowedOrigins.has(origin))
+    origin: (origin, callback) => callback(null, originAllowed(origin, allowedOrigins)),
+    preflightContinue: true,
+    optionsSuccessStatus: 204
   })
 );
 // 公网隧道域名可能包含 `/api/*` 路径，必须先按 Host 分流，避免被控制中心鉴权拦截。
@@ -40,13 +73,22 @@ app.use(
 app.use((req, res, next) => {
   const publicMatch = req.originalUrl.match(/^\/public\/([^/?]+)(\/[^?]*)?(\?.*)?$/);
   if (publicMatch) {
+    applyPublicCors(req, res);
+    if (req.method === "OPTIONS") return res.sendStatus(204);
     const tunnelId = decodeURIComponent(publicMatch[1]);
     const forwardedPath = `${publicMatch[2] || "/"}${publicMatch[3] || ""}`;
     return forwardPublicHttp(tunnelId, forwardedPath, req, res, next);
   }
   const tunnel = findTunnelByHost(req.headers);
   if (!tunnel) return next();
+  applyPublicCors(req, res);
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   return forwardPublicHttp(tunnel.id, req.originalUrl || "/", req, res, next);
+});
+// CORS 已写入允许的控制中心响应头；对非公网隧道的预检请求统一结束响应。
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
 });
 app.use(express.json({ limit: "2mb" }));
 app.use("/api", (req, res, next) => {
@@ -110,8 +152,23 @@ const serverSchema = z.object({
 });
 const nodeSelect = `SELECT id,name,host,status,server_host,ssh_user,ssh_port,controller_url,
   controller_token,deploy_status,last_checked_at,last_error FROM nodes`;
-type DeployJob={id:string;nodeId:string;status:"running"|"success"|"error";logs:Array<{time:string;message:string}>;result?:unknown;error?:string};
+type DeployJob={id:string;nodeId:string;status:"running"|"success"|"error";logs:Array<{time:string;message:string}>;createdAt:number;result?:unknown;error?:string};
 const deployJobs=new Map<string,DeployJob>();
+// 部署任务仅用于前端轮询进度，长期运行时清理已结束的任务避免内存缓慢增长。
+const MAX_FINISHED_DEPLOY_JOBS = 50;
+function pruneDeployJobs() {
+  const now = Date.now();
+  for (const [id, job] of deployJobs) {
+    if (job.status !== "running" && now - job.createdAt > 3_600_000) deployJobs.delete(id);
+  }
+  const finished = [...deployJobs.values()]
+    .filter((job) => job.status !== "running")
+    .sort((left, right) => left.createdAt - right.createdAt);
+  while (finished.length > MAX_FINISHED_DEPLOY_JOBS) {
+    const oldest = finished.shift();
+    if (oldest) deployJobs.delete(oldest.id);
+  }
+}
 const appendJobLog=(job:DeployJob,message:string)=>job.logs.push({time:new Date().toISOString(),message});
 let lastNodeHealthRefresh=0;
 async function refreshNodeHealth(){
@@ -159,12 +216,6 @@ type AccessLogRow = {
   duration: number;
   bytes: number;
 };
-
-function clientIp(req: express.Request) {
-  const cloudflare = req.headers["cf-connecting-ip"];
-  const realIp = req.headers["x-real-ip"];
-  return String(cloudflare || realIp || req.ip || "unknown").split(",")[0].trim();
-}
 
 function recordObservation(
   tunnelId: string,
@@ -280,17 +331,54 @@ async function syncNodeTunnels(nodeId: string) {
   return { total: rows.length, success: rows.length - errors.length, failed: errors.length, errors };
 }
 async function syncAllTunnels() {
-  for (const row of tunnelRows() as Array<Record<string, any>>) {
-    await syncTunnelToNode(row.id, "upsert");
-  }
+  const rows = (tunnelRows() as Array<Record<string, any>>).filter(
+    (row) => row.controller_url && row.controller_token
+  );
+  if (!rows.length) return;
+  await Promise.all(rows.map((row) => syncTunnelToNode(row.id, "upsert")));
+  // 对所有已就绪节点下发对账：节点控制器删除主控已不存在的残留隧道（含零隧道节点）。
+  // 残留行会和现役隧道抢同域名的路由，导致流量进入没有 agent 的死隧道。
+  const targets = configuredNodeControllers();
+  await Promise.all(
+    targets.map(async (node) => {
+      const base = node.controller_url.replace(/\/api\/?$/, "").replace(/:8789$/, ":8788");
+      const ids = rows
+        .filter((row) => row.controller_url === node.controller_url)
+        .map((row) => String(row.id));
+      try {
+        await fetch(`${base}/internal/tunnels/sync`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${node.controller_token}`
+          },
+          body: JSON.stringify({ action: "reconcile", ids }),
+          signal: AbortSignal.timeout(5000)
+        });
+      } catch (error) {
+        console.warn("[tunnel-sync] 节点对账失败:", error instanceof Error ? error.message : error);
+      }
+    })
+  );
 }
 setTimeout(() => { void syncAllTunnels(); }, 1500);
 setInterval(() => { void syncAllTunnels(); }, 30_000);
 app.post("/internal/tunnels/sync", (req, res) => {
   if (process.env.NEXIOUS_ADMIN_TOKEN && req.headers.authorization !== `Bearer ${process.env.NEXIOUS_ADMIN_TOKEN}`) return res.status(401).json({ message: "节点同步认证失败" });
-  const body = z.object({ action: z.enum(["upsert", "delete"]), tunnel: z.record(z.any()) }).parse(req.body);
-  if (body.action === "delete") db.prepare("DELETE FROM tunnels WHERE id=?").run(body.tunnel.id);
-  else {
+  const body = z.object({ action: z.enum(["upsert", "delete", "reconcile"]), tunnel: z.record(z.any()).optional(), ids: z.array(z.string()).optional() }).parse(req.body);
+  // 对账只在节点控制器上执行：按主控下发的 id 列表清除残留隧道。主控自身
+  // 存着全量数据，绝不能按列表删自己。
+  if (body.action === "reconcile") {
+    if (!isNodeController) return res.json({ ok: true, skipped: true });
+    const ids = body.ids || [];
+    const result = ids.length
+      ? db.prepare(`DELETE FROM tunnels WHERE id NOT IN (${ids.map(() => "?").join(",")})`).run(...ids)
+      : db.prepare("DELETE FROM tunnels").run();
+    if (result.changes) console.warn(`[tunnel-sync] 对账清理了 ${result.changes} 条残留隧道`);
+    return res.json({ ok: true, removed: result.changes });
+  }
+  if (body.action === "delete" && body.tunnel) db.prepare("DELETE FROM tunnels WHERE id=?").run(body.tunnel.id);
+  else if (body.action === "upsert" && body.tunnel) {
     // 节点控制器使用与主控相同的查询结构，需要先建立对应的本地节点记录。
     // 主控同步的 node_id/node_host 是可信配置数据；缺失时使用稳定的本地 ID，避免 NOT NULL 约束导致整条隧道丢失。
     const nodeId = String(body.tunnel.node_id || "node-local");
@@ -455,8 +543,11 @@ app.post("/api/nodes/:id/inspect", async (req, res, next) => {
     const node = db.prepare(`${nodeSelect} WHERE id=?`).get(req.params.id) as Record<string, string> | undefined;
     if (!node) return res.status(404).json({ message: "节点不存在" });
     const result = await inspectNode({ host, username, password: value.password, port: value.port }, node.controller_token);
-    db.prepare("UPDATE nodes SET server_host=?,ssh_user=?,ssh_port=?,controller_url=COALESCE(?,controller_url),controller_token=COALESCE(?,controller_token),deploy_status=?,status=?,last_checked_at=?,last_error=? WHERE id=?")
-      .run(host, username, value.port, result.controllerUrl||null, result.token||null, result.healthy ? "ready" : result.configured ? "error" : "unconfigured",result.healthy?"online":"maintenance", new Date().toISOString(), result.healthy ? null : result.message, req.params.id);
+    // 已配置的节点不因 inspect 降级：保留现有 controller_url/token（例如已切换 HTTPS 的节点）。
+    const nextControllerUrl = node.controller_url || result.controllerUrl || null;
+    const nextControllerToken = node.controller_token || result.token || null;
+    db.prepare("UPDATE nodes SET server_host=?,ssh_user=?,ssh_port=?,controller_url=?,controller_token=?,deploy_status=?,status=?,last_checked_at=?,last_error=? WHERE id=?")
+      .run(host, username, value.port, nextControllerUrl, nextControllerToken, result.healthy ? "ready" : result.configured ? "error" : "unconfigured",result.healthy?"online":"maintenance", new Date().toISOString(), result.healthy ? null : result.message, req.params.id);
     res.json(result);
   } catch (error) { next(error); }
 });
@@ -464,16 +555,18 @@ app.post("/api/nodes/:id/deploy", async (req, res, next) => {
   try {
     const value = serverSchema.parse(req.body);
     const [username, host] = value.connection.split("@");
-    if (!db.prepare("SELECT id FROM nodes WHERE id=?").get(req.params.id)) return res.status(404).json({ message: "节点不存在" });
+    const nodeRow = db.prepare("SELECT host FROM nodes WHERE id=?").get(req.params.id) as { host: string } | undefined;
+    if (!nodeRow) return res.status(404).json({ message: "节点不存在" });
     db.prepare("UPDATE nodes SET server_host=?,ssh_user=?,ssh_port=?,deploy_status='deploying',last_error=NULL WHERE id=?")
       .run(host, username, value.port, req.params.id);
     const active=[...deployJobs.values()].find(job=>job.nodeId===req.params.id&&job.status==="running");
     if(active)return res.status(409).json({message:"该节点已有部署任务正在运行"});
-    const job:DeployJob={id:randomUUID(),nodeId:req.params.id,status:"running",logs:[]};
+    pruneDeployJobs();
+    const job:DeployJob={id:randomUUID(),nodeId:req.params.id,status:"running",logs:[],createdAt:Date.now()};
     deployJobs.set(job.id,job);appendJobLog(job,"部署任务已创建");
     res.status(202).json({jobId:job.id});
     void (async()=>{try {
-      const result = await deployNode({ host, username, password: value.password, port: value.port },message=>appendJobLog(job,message), value.force);
+      const result = await deployNode({ host, username, password: value.password, port: value.port },message=>appendJobLog(job,message), value.force, nodeRow.host);
       db.prepare("UPDATE nodes SET controller_url=?,controller_token=?,deploy_status='ready',status='online',last_checked_at=?,last_error=NULL WHERE id=?")
         .run(result.controllerUrl, result.token, new Date().toISOString(), req.params.id);
       appendJobLog(job, "控制中心已就绪，开始立即同步该节点的隧道配置");
@@ -610,19 +703,20 @@ function rawDataLength(data: WebSocket.RawData) {
     : Buffer.from(data as ArrayBuffer).length;
 }
 
-function normalizeHost(value: unknown) {
-  return String(value || "").split(",")[0].trim().split(":")[0].replace(/\.$/, "").toLowerCase();
-}
-
 function findTunnelByHost(headers: IncomingMessage["headers"]) {
-  const hostCandidates = [headers["x-forwarded-host"], headers.host]
-    .map(normalizeHost)
-    .filter(Boolean);
+  const hostCandidates = tunnelHostCandidates(headers);
   const tunnels = db
     .prepare("SELECT t.id,t.domain,n.host FROM tunnels t JOIN nodes n ON n.id=t.node_id")
     .all() as Array<{ id: string; domain: string; host: string }>;
-  return tunnels.find((item) =>
+  const matches = tunnels.filter((item) =>
     hostCandidates.includes(normalizeHost(`${item.domain}.${item.host}`))
+  );
+  if (matches.length <= 1) return matches[0];
+  // 同域名存在多条记录（如历史残留）时，优先路由到 agent 实际在线的隧道。
+  return (
+    matches.find(
+      (item) => agents.get(item.id)?.readyState === WebSocket.OPEN
+    ) || matches[0]
   );
 }
 
@@ -705,7 +799,7 @@ function handlePublicWebSocketUpgrade(request: IncomingMessage, socket: Duplex, 
       socket: browserSocket,
       tunnelId: resolved.tunnelId,
       path: resolved.path,
-      clientIp: String(request.headers["cf-connecting-ip"] || request.socket.remoteAddress || "unknown"),
+      clientIp: resolveClientIp(request.headers, request.socket.remoteAddress || undefined, trustProxyHeaders),
       startedAt: Date.now(),
       inbound: 0,
       outbound: 0
@@ -758,8 +852,11 @@ relay.on("connection", (socket, request) => {
   }
   const query = new URL(request.url || "", `http://${request.headers.host}`)
     .searchParams;
-  const tunnelId = query.get("tunnel"),
-    token = query.get("token");
+  const tunnelId = query.get("tunnel");
+  // 优先使用 Authorization 头，避免 token 出现在 URL 中被中间代理记录；保留
+  // query 参数用于兼容旧版 agent。
+  const headerToken = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const token = headerToken || query.get("token");
   const row = tunnelId
     ? db
         .prepare("SELECT id FROM tunnels WHERE id=? AND agent_token=?")
@@ -793,7 +890,9 @@ relay.on("connection", (socket, request) => {
       }
       pending.get(message.id)?.(message);
       pending.delete(message.id);
-    } catch {}
+    } catch (error) {
+      console.warn("[relay] 无法处理 agent 消息", error);
+    }
   });
   socket.on("close", () => {
     if (agents.get(tunnelId) === socket) agents.delete(tunnelId);
@@ -822,8 +921,21 @@ function forwardToAgent(
   const id = randomUUID(),
     chunks: Buffer[] = [],
     startedAt = Date.now();
-  req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+  let requestBytes = 0;
+  let oversized = false;
+  req.on("data", (chunk) => {
+    if (oversized) return;
+    requestBytes += chunk.length;
+    if (requestBytes > maxBodyBytes) {
+      oversized = true;
+      recordObservation(tunnelId, clientIp(req), req.method, forwardedPath, 413, Date.now() - startedAt, 0, requestBytes);
+      res.status(413).json({ message: `请求体超过 ${Math.round(maxBodyBytes / 1048576)}MB 上限` });
+      return;
+    }
+    chunks.push(Buffer.from(chunk));
+  });
   req.on("end", () => {
+    if (oversized) return;
     const timer = setTimeout(() => {
       if (pending.delete(id) && !res.headersSent) {
         recordObservation(tunnelId, clientIp(req), req.method, forwardedPath, 504, Date.now() - startedAt, 0, Buffer.concat(chunks).length);
@@ -857,6 +969,7 @@ function forwardToAgent(
           res.setHeader(key, values.length === 1 ? values[0] : values);
         }
       }
+      applyPublicCors(req, res);
       res.end(responseBody);
     });
     // 浏览器访问隧道域名时会携带该公网域名的 Origin。直接转发会触发
@@ -904,7 +1017,7 @@ async function proxyHttpToUpstream(
   try {
     const target = `${upstream.replace(/\/$/, "")}${forwardedPath}`;
     const headers = new Headers(req.headers as HeadersInit);
-    for (const name of [...hopByHopHeaders, "host", "content-length"]) headers.delete(name);
+    for (const name of [...hopByHopHeaders, "host", "content-length", "origin", "referer"]) headers.delete(name);
     headers.set("x-forwarded-host", req.headers.host || "");
     headers.set("x-forwarded-proto", req.protocol);
     headers.set("x-forwarded-for", req.ip || "");
@@ -923,6 +1036,7 @@ async function proxyHttpToUpstream(
     });
     const cookies = (response.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie?.();
     if (cookies?.length) res.setHeader("set-cookie", cookies.map(normalizeLocalCookieDomain));
+    applyPublicCors(req, res);
     res.end(Buffer.from(await response.arrayBuffer()));
   } catch (error) {
     next(error);
@@ -963,6 +1077,16 @@ const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
   res.status(500).json({ message: "服务暂时不可用" });
 };
 app.use(errorHandler);
+// 访问日志与流量记录只写不删会让数据库无限膨胀；启动时和每小时清理过期数据。
+function pruneRetention() {
+  try {
+    pruneOldData();
+  } catch (error) {
+    console.warn("[retention] 清理过期记录失败", error);
+  }
+}
+pruneRetention();
+setInterval(pruneRetention, 60 * 60 * 1000);
 const bindHost=process.env.BIND_HOST||"127.0.0.1";
 httpServer.listen(port, bindHost, () =>
   console.log(`Nexious API listening on http://${bindHost}:${port}`)

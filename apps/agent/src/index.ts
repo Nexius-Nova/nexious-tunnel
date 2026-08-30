@@ -18,8 +18,12 @@ function localRequestHeaders(headers: IncomingHttpHeaders | undefined, url: URL,
 }
 
 function sendFailure(socket: WebSocket, id: unknown) {
+  if (!id) return
   socket.send(JSON.stringify({id,status:502,headers:{'content-type':'text/plain'},body:Buffer.from('local service unavailable').toString('base64')}))
 }
+
+// 响应体整包缓冲后经 base64+JSON 转发，限制上限避免大文件打爆内存。
+const MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 function localWebSocketHeaders(headers: IncomingHttpHeaders | undefined): IncomingHttpHeaders {
   const forwarded = localRequestHeaders(headers, new URL('http://localhost'), 0)
@@ -73,7 +77,11 @@ const args = Object.fromEntries(process.argv.slice(2).reduce<string[][]>((all, v
 const relay = args.relay, tunnel = args.tunnel, token = args.token, target = args.target
 if (!relay || !tunnel || !token || !target) { console.error('用法: pnpm --filter @nexious/agent start -- --relay ws://host/relay --tunnel tun-id --token TOKEN --target http://127.0.0.1:8080'); process.exit(1) }
 const connect = () => {
-  const socket = new WebSocket(`${relay}?tunnel=${encodeURIComponent(tunnel)}&token=${encodeURIComponent(token)}`)
+  // token 同时放入 Authorization 头，避免被中间代理的访问日志记录在 URL 中；
+  // query 参数保留用于兼容旧版服务端。
+  const socket = new WebSocket(`${relay}?tunnel=${encodeURIComponent(tunnel)}&token=${encodeURIComponent(token)}`, {
+    headers: { authorization: `Bearer ${token}` }
+  })
   socket.on('open', () => console.log(`[agent] ${tunnel} connected -> ${target}`))
   socket.on('message', (raw) => {
     try {
@@ -86,12 +94,29 @@ const connect = () => {
       const body = Buffer.from(message.body || '', 'base64')
       const req = request(url, { method:message.method, headers:localRequestHeaders(message.headers, url, body.length) }, (response) => {
         const chunks:Buffer[]=[]
-        response.on('data',(chunk)=>chunks.push(chunk))
-        response.on('end',()=>socket.send(JSON.stringify({id:message.id,status:response.statusCode,headers:response.headers,body:Buffer.concat(chunks).toString('base64')})))
+        let received = 0
+        let oversized = false
+        response.on('data',(chunk)=>{
+          if (oversized) return
+          received += chunk.length
+          if (received > MAX_RESPONSE_BYTES) {
+            oversized = true
+            response.destroy()
+            socket.send(JSON.stringify({id:message.id,status:413,headers:{'content-type':'text/plain'},body:Buffer.from('tunnel response exceeds size limit').toString('base64')}))
+            return
+          }
+          chunks.push(chunk)
+        })
+        response.on('end',()=>{
+          if (oversized) return
+          socket.send(JSON.stringify({id:message.id,status:response.statusCode,headers:response.headers,body:Buffer.concat(chunks).toString('base64')}))
+        })
+        response.on('aborted',()=>sendFailure(socket, message.id))
       })
       req.on('error',()=>sendFailure(socket, message.id))
       req.end(body)
-    } catch {
+    } catch (error) {
+      console.error('[agent] 消息处理失败', error)
       sendFailure(socket, undefined)
     }
   })

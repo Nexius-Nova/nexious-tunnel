@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -20,6 +21,8 @@
         "minHeight": 620,
         "resizable": true,
         "center": true,
+        "visible": false,
+        "backgroundColor": "#101315",
         "decorations": false
       }
     ],
