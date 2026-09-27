@@ -38,15 +38,19 @@ const rules: FormRules = {
   host: { required: true, min: 3, message: "请输入节点域名", trigger: "blur" }
 };
 async function submit() {
-  await formRef.value?.validate();
+  try {
+    await formRef.value?.validate();
+  } catch {
+    return;
+  }
   emit("submit", { ...form });
 }
 </script>
 
 <template>
-  <n-modal :show="show" preset="card" :title="node ? '编辑边缘节点' : '添加边缘节点'" :style="{ width: '460px' }" :mask-closable="false" @close="emit('close')">
+  <n-modal :show="show" preset="card" :title="node ? '编辑边缘节点' : '添加边缘节点'" :style="{ width: 'min(460px, calc(100vw - 32px))' }" :mask-closable="false" @close="emit('close')">
     <div class="modal-intro"><b>{{ node ? "更新节点信息" : "添加中转节点" }}</b><span>节点域名用于生成子域名访问地址。</span></div>
-    <n-form ref="formRef" :model="form" :rules="rules" label-placement="top">
+    <n-form ref="formRef" :model="form" :rules="rules" label-placement="top" :disabled="loading">
       <n-form-item label="节点名称" path="name"><n-input v-model:value="form.name" placeholder="例如：主节点" /></n-form-item>
       <n-form-item label="节点域名" path="host"><n-input v-model:value="form.host" placeholder="tunnel.example.com" /></n-form-item>
     </n-form>

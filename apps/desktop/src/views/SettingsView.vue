@@ -1,30 +1,36 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useQueryClient } from "@tanstack/vue-query";
-import { NButton, NFormItem, NInput, NInputNumber, NSwitch, useMessage } from "naive-ui";
+import { NAlert, NButton, NInputNumber, NSwitch, useMessage } from "naive-ui";
 import { MonitorUp, Moon, PanelTopClose, Save } from "lucide-vue-next";
 import type { Preferences } from "../types";
 import PageHeader from "../components/PageHeader.vue";
 import StateBlock from "../components/StateBlock.vue";
+import ThemeStylePicker from "../components/ThemeStylePicker.vue";
+import { setThemeMode, themeLight } from "../theme";
 
 const message = useMessage();
 const queryClient = useQueryClient();
-const darkMode = ref(localStorage.getItem("nexious-theme") !== "light");
+const native = isTauri();
+const loadError = ref("");
 const loading = ref(true),
   saving = ref(false);
 const form = reactive<Preferences>({
   autoStart: false,
   minimizeToTray: true,
   apiUrl: "http://127.0.0.1:8787",
-  apiToken: "",
   maxBodyMb: 25,
   logRetentionDays: 30,
   trafficRetentionDays: 90
 });
 const saved = ref<Preferences>({ ...form });
+// 逐字段比较：JSON.stringify 对键序敏感，且会把用户无法编辑的
+// apiUrl/maxBodyMb 一并纳入，服务端返回的键序差异就会造成"未修改却提示已修改"。
 const changed = computed(
-  () => JSON.stringify(form) !== JSON.stringify(saved.value)
+  () =>
+    form.logRetentionDays !== saved.value.logRetentionDays ||
+    form.trafficRetentionDays !== saved.value.trafficRetentionDays
 );
 const items = [
   {
@@ -41,22 +47,25 @@ const items = [
   }
 ];
 
-onMounted(async () => {
+async function loadPreferences() {
+  if (!native) { loading.value = false; return; }
+  loading.value = true; loadError.value = "";
   try {
     const value = await invoke<Preferences>("get_desktop_preferences");
     Object.assign(form, value);
     saved.value = { ...value };
   } catch (error) {
-    message.error(error instanceof Error ? error.message : String(error));
+    loadError.value = error instanceof Error ? error.message : String(error);
   } finally {
     loading.value = false;
   }
-});
+}
+onMounted(loadPreferences);
 
 async function save() {
+  if (!native || saving.value || loadError.value) return;
   saving.value = true;
   try {
-    form.apiUrl = form.apiUrl.trim().replace(/\/+$/, "");
     const value = await invoke<Preferences>("set_desktop_preferences", {
       preferences: { ...form }
     });
@@ -74,6 +83,7 @@ async function updateDesktopPreference(
   key: "autoStart" | "minimizeToTray",
   value: boolean
 ) {
+  if (!native || saving.value || loadError.value) return;
   const previous = form[key];
   form[key] = value;
   saving.value = true;
@@ -92,29 +102,32 @@ async function updateDesktopPreference(
   }
 }
 function setTheme(value:boolean) {
-  darkMode.value=value;
-  localStorage.setItem("nexious-theme",value?"dark":"light");
-  window.dispatchEvent(new CustomEvent("nexious-theme-change",{detail:value?"dark":"light"}));
+  setThemeMode(!value);
 }
 </script>
 
 <template>
   <div class="view settings-view">
     <PageHeader
-      eyebrow="DESKTOP CONTROL"
       title="偏好设置"
-      description="控制客户端的启动方式与后台运行行为。"
+      :description="native ? '控制客户端的启动方式与后台运行行为。' : '设置当前浏览器的界面偏好。'"
     />
     <StateBlock v-if="loading" loading />
+    <StateBlock v-else-if="loadError" :error="loadError"><n-button @click="loadPreferences">重试</n-button></StateBlock>
     <template v-else>
+      <n-alert v-if="!native" type="info" :bordered="false" class="browser-preferences">启动与后台运行设置请在桌面客户端中修改。</n-alert>
       <section class="settings-panel">
-        <h2>桌面偏好</h2>
+        <h2>主题风格</h2>
+        <ThemeStylePicker />
+      </section>
+      <section class="settings-panel">
+        <h2>{{ native ? '桌面偏好' : '界面偏好' }}</h2>
         <div class="setting-row">
           <i><Moon /></i>
-          <div><b>深色主题</b><span>切换当前设备上的黑白界面主题</span></div>
-          <n-switch :value="darkMode" aria-label="深色主题" @update:value="setTheme" />
+          <div><b>深色主题</b><span>切换当前设备上的深浅色界面模式</span></div>
+          <n-switch :value="themeLight" aria-label="深色主题" @update:value="setTheme" />
         </div>
-        <div v-for="item in items" :key="item.key" class="setting-row">
+        <div v-for="item in native ? items : []" :key="item.key" class="setting-row">
           <i><component :is="item.icon" /></i>
           <div>
             <b>{{ item.title }}</b
@@ -128,21 +141,9 @@ function setTheme(value:boolean) {
           />
         </div>
       </section>
-      <section class="settings-panel">
+      <section v-if="native" class="settings-panel">
         <h2>本地服务</h2>
         <p class="section-description">作用于本机内置的控制中心服务，保存后自动重启生效。</p>
-        <div class="setting-row">
-          <div><b>隧道请求体上限</b><span>超过上限的请求返回 413，1 - 1024 MB</span></div>
-          <n-input-number
-            v-model:value="form.maxBodyMb"
-            class="number-input"
-            :min="1"
-            :max="1024"
-            :step="5"
-            :disabled="saving"
-            aria-label="隧道请求体上限"
-          ><template #suffix>MB</template></n-input-number>
-        </div>
         <div class="setting-row">
           <div><b>访问日志保留天数</b><span>后台自动清理过期日志</span></div>
           <n-input-number
@@ -166,27 +167,13 @@ function setTheme(value:boolean) {
           ><template #suffix>天</template></n-input-number>
         </div>
       </section>
-      <section class="settings-panel server-settings">
-        <h2>主控制中心</h2>
-        <p class="section-description">用于读取和管理全部边缘节点及隧道。每个节点的独立连接凭据在“边缘节点”页面维护。</p>
-        <div class="server-form">
-          <n-form-item label="主控制中心 API 地址"
-            ><n-input
-              v-model:value="form.apiUrl"
-                placeholder="https://relay.example.com"
-          /></n-form-item>
-          <n-form-item label="主控制中心 Token"
-            ><n-input
-              v-model:value="form.apiToken"
-              type="password"
-              show-password-on="click"
-              placeholder="填写服务器管理 Token"
-          /></n-form-item>
-        </div>
+      <section v-if="native" class="settings-panel server-settings">
+        <h2>控制中心</h2>
+        <p class="section-description">客户端固定连接本机内置的控制中心，无需手动配置地址；边缘节点凭据在“边缘节点”页面维护。</p>
       </section>
     </template>
     <transition name="save-pill">
-      <div v-if="changed" class="save-pill">
+      <div v-if="native && !loadError && changed" class="save-pill">
         <span>有未保存的更改</span>
         <n-button type="primary" :loading="saving" @click="save"
           ><template #icon><Save /></template>保存设置</n-button
@@ -197,6 +184,7 @@ function setTheme(value:boolean) {
 </template>
 
 <style scoped>
+.browser-preferences { margin-bottom: 20px; }
 /* 悬浮保存按钮：仅在存在未保存更改时出现，任何滚动位置都可见，保存后消失 */
 .save-pill {
   position: fixed;
@@ -227,8 +215,8 @@ function setTheme(value:boolean) {
 }
 :global(.theme-light) .save-pill {
   background: #ffffff;
-  border-color: #d8dedb;
-  box-shadow: 0 10px 28px rgba(20, 32, 26, 0.14);
+  border-color: var(--border);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
 }
 @media (max-width: 700px) {
   .save-pill {
@@ -244,23 +232,9 @@ function setTheme(value:boolean) {
 .settings-view :deep(.settings-panel h2) {
   padding: 12px 18px 10px;
 }
-.server-form {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  padding: 6px 18px 16px;
-}
-.server-form :deep(.n-form-item) {
-  margin: 0;
-}
 .section-description{margin:0;padding:12px 18px 0;color:var(--text-secondary);font-size:12px}
 .settings-panel .setting-row > div{flex:1;min-width:0}
 .settings-panel .setting-row > div b{display:block;font-size:13px}
 .settings-panel .setting-row > div span{display:block;margin-top:3px;color:var(--text-secondary);font-size:11px}
 .number-input{width:150px}
-@media (max-width: 700px) {
-  .server-form {
-    grid-template-columns: 1fr;
-  }
-}
 </style>

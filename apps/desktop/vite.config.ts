@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import vue from "@vitejs/plugin-vue";
 export default defineConfig({
   plugins: [vue()],
@@ -12,5 +12,9 @@ export default defineConfig({
       }
     }
   },
-  clearScreen: false
+  clearScreen: false,
+  test: {
+    // 仅扫描 src 下的单元测试，避免误抓 src-tauri/target 中打包进去的服务端测试副本。
+    include: ["src/**/*.test.ts"]
+  }
 });

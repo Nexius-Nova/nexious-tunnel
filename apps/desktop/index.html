@@ -3,31 +3,43 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <meta name="theme-color" content="#101315" />
+    <meta name="theme-color" content="#101112" />
     <link rel="icon" href="data:," />
     <title>Nexious Tunnel</title>
     <style>
       *{margin:0;padding:0;box-sizing:border-box}
-      body{font-family:"Microsoft YaHei","Segoe UI",sans-serif;overflow:hidden}
+      body{font-family:"Microsoft YaHei","Segoe UI",sans-serif;overflow:hidden;--splash-accent:#ef4444;--splash-rgb:239,68,68;--splash-bg:#101112}
+      /* 与应用内风格预设保持一致（见 src/theme.ts），由 theme-boot.js 在首帧前写入 data-accent */
+      body[data-accent="claw"]{--splash-accent:#e5484d;--splash-rgb:229,72,77;--splash-bg:#0d0e0f}
+      body[data-accent="knot"]{--splash-accent:#818cf8;--splash-rgb:129,140,248;--splash-bg:#101014}
+      body[data-accent="dash"]{--splash-accent:#22c9dd;--splash-rgb:34,201,221;--splash-bg:#0e1214}
+      body[data-accent="forest"]{--splash-accent:#3fb970;--splash-rgb:63,185,112;--splash-bg:#0f1211}
+      body[data-accent="slate"]{--splash-accent:#7f95ad;--splash-rgb:127,149,173;--splash-bg:#12161d}
+      body[data-accent="paper"]{--splash-accent:#cf9264;--splash-rgb:207,146,100;--splash-bg:#121110}
+      body[data-accent="amber"]{--splash-accent:#f5a623;--splash-rgb:245,166,35;--splash-bg:#11100c}
+      body.light[data-accent="claw"]{--splash-accent:#b42318;--splash-rgb:180,35,24;--splash-bg:#f5f5f6}
+      body.light[data-accent="knot"]{--splash-accent:#4f46e5;--splash-rgb:79,70,229;--splash-bg:#f5f5f8}
+      body.light[data-accent="dash"]{--splash-accent:#0d8aa2;--splash-rgb:13,138,162;--splash-bg:#f4f7f8}
+      body.light[data-accent="forest"]{--splash-accent:#15803d;--splash-rgb:21,128,61;--splash-bg:#f4f7f5}
+      body.light[data-accent="slate"]{--splash-accent:#4d6a85;--splash-rgb:77,106,133;--splash-bg:#f3f5f7}
+      body.light[data-accent="paper"]{--splash-accent:#9a5f33;--splash-rgb:154,95,51;--splash-bg:#faf8f4}
+      body.light[data-accent="amber"]{--splash-accent:#b45309;--splash-rgb:180,83,9;--splash-bg:#faf7f0}
       /* ── Dark (default) ── */
-      body{background:#101315}
-      #splash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;background:#101315;z-index:9999;transition:opacity .4s ease}
+      body{background:var(--splash-bg)}
+      #splash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;background:var(--splash-bg);z-index:9999;transition:opacity .4s ease}
       #splash.fade-out{opacity:0;pointer-events:none}
-      .splash-logo{width:48px;height:48px;border:1.5px solid #39d98a;border-radius:8px;display:grid;place-items:center;color:#39d98a;animation:splashPulse 2s ease-in-out infinite}
+      .splash-logo{width:48px;height:48px;border:1.5px solid var(--splash-accent);border-radius:8px;display:grid;place-items:center;color:var(--splash-accent);animation:splashPulse 2s ease-in-out infinite}
       .splash-logo svg{width:24px;height:24px}
-      .splash-text{color:#7f8a86;font-size:12px;letter-spacing:1.5px;font-family:Consolas,"Courier New",monospace}
-      .splash-bar{width:120px;height:2px;background:#252b2e;border-radius:1px;overflow:hidden}
-      .splash-bar-inner{width:40%;height:100%;background:#39d98a;border-radius:1px;animation:splashSlide 1.2s ease-in-out infinite}
-      @keyframes splashPulse{0%,100%{box-shadow:0 0 0 0 rgba(57,217,138,0)}50%{box-shadow:0 0 0 8px rgba(57,217,138,.1)}}
+      .splash-text{color:#8b9391;font-size:12px;letter-spacing:1.5px;font-family:Consolas,"Courier New",monospace}
+      .splash-bar{width:120px;height:2px;background:#272a2c;border-radius:1px;overflow:hidden}
+      .splash-bar-inner{width:40%;height:100%;background:var(--splash-accent);border-radius:1px;animation:splashSlide 1.2s ease-in-out infinite}
+      @keyframes splashPulse{0%,100%{box-shadow:0 0 0 0 rgba(var(--splash-rgb),0)}50%{box-shadow:0 0 0 8px rgba(var(--splash-rgb),.1)}}
       @keyframes splashSlide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
       /* ── Light theme override ── */
-      body.light{background:#f3f5f4}
-      body.light #splash{background:#f3f5f4}
-      body.light .splash-logo{border-color:#239b61;color:#239b61;animation-name:splashPulseLight}
-      body.light .splash-text{color:#68736e}
-      body.light .splash-bar{background:#d8dedb}
-      body.light .splash-bar-inner{background:#239b61}
-      @keyframes splashPulseLight{0%,100%{box-shadow:0 0 0 0 rgba(35,155,97,0)}50%{box-shadow:0 0 0 8px rgba(35,155,97,.12)}}
+      body.light{background:var(--splash-bg)}
+      body.light #splash{background:var(--splash-bg)}
+      body.light .splash-text{color:#666e6b}
+      body.light .splash-bar{background:#e2e6e5}
     </style>
   </head>
   <body>
@@ -39,24 +51,8 @@
       <div class="splash-text">NEXIOUS TUNNEL</div>
       <div class="splash-bar"><div class="splash-bar-inner"></div></div>
     </div>
-    <script>
-      // 主题判定必须在首帧绘制前完成，避免浅色主题下闪现深色启动页
-      if(localStorage.getItem('nexious-theme')==='light'||(!localStorage.getItem('nexious-theme')&&window.matchMedia('(prefers-color-scheme:light)').matches)){
-        document.body.classList.add('light');
-        document.querySelector('meta[name="theme-color"]')?.setAttribute('content','#f3f5f4');
-      }
-      // 窗口以隐藏方式启动，等启动页完成首帧绘制后再显示，避免看到空白窗口
-      if(window.__TAURI__){
-        requestAnimationFrame(()=>requestAnimationFrame(()=>{
-          try{
-            const api=window.__TAURI__.window;
-            const current=(api.getCurrentWindow??api.getCurrent)?.call(api);
-            current?.show()?.catch?.(()=>{});
-            current?.setFocus()?.catch?.(()=>{});
-          }catch{}
-        }));
-      }
-    </script>
+    <!-- 引导脚本放在独立文件中，避免内联脚本被 CSP 拦截（见 public/theme-boot.js） -->
+    <script src="/theme-boot.js"></script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

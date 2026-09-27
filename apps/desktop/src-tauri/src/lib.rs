@@ -25,12 +25,19 @@ use tokio_tungstenite::tungstenite::{
 };
 
 const LOCAL_API_URL: &str = "http://127.0.0.1:8787";
+mod secure_session;
 const LOCAL_API_PORT: u16 = 8787;
 // 隧道响应体上限：整包 base64+JSON 转发在内存中完成，必须限制大小防止打爆内存。
 const TUNNEL_RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct AgentManager(Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>);
+
+#[derive(Clone, Deserialize)]
+struct DirectRelay {
+    url: String,
+    address: String,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,6 +192,7 @@ fn start_agent(
     token: String,
     relay: String,
     target: String,
+    direct_relay: Option<DirectRelay>,
 ) -> Result<(), String> {
     let mut processes = manager
         .0
@@ -194,7 +202,7 @@ fn start_agent(
         existing.abort();
     }
     let key = tunnel_id.clone();
-    let task = tauri::async_runtime::spawn(run_agent(relay, tunnel_id, token, target));
+    let task = tauri::async_runtime::spawn(run_agent(relay, tunnel_id, token, target, direct_relay));
     processes.insert(key, task);
     Ok(())
 }
@@ -211,12 +219,70 @@ fn stop_agent(manager: tauri::State<'_, AgentManager>, tunnel_id: String) -> Res
     Ok(())
 }
 
-async fn run_agent(relay: String, tunnel_id: String, token: String, target: String) {
+/// 退出登录时停止所有本机 agent：agent 持有的是隧道 token，与用户会话无关，
+/// 不主动停止的话用户登出后转发仍在后台进行（服务端 agent 掉线会把状态收敛为 stopped）。
+#[tauri::command]
+fn stop_all_agents(manager: tauri::State<'_, AgentManager>) -> Result<(), String> {
+    let mut processes = manager
+        .0
+        .lock()
+        .map_err(|_| "Agent 状态不可用".to_string())?;
+    for (_, process) in processes.drain() {
+        process.abort();
+    }
+    Ok(())
+}
+
+async fn connect_agent_relay(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    direct_relay: Option<&DirectRelay>,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    String,
+> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        if let Some(direct) = direct_relay {
+            if request.uri().scheme_str() != Some("wss") {
+                return Err("direct relay requires TLS".to_string());
+            }
+            let stream = tokio::net::TcpStream::connect(&direct.address)
+                .await
+                .map_err(|error| error.to_string())?;
+            stream.set_nodelay(true).map_err(|error| error.to_string())?;
+            // 默认 TLS 连接器继续校验 URL 域名与受信任证书，IP 仅用于 TCP 连接。
+            tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            tokio_tungstenite::connect_async_with_config(request, None, true)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|_| "relay connection timeout".to_string())?
+}
+
+async fn run_agent(
+    relay: String,
+    tunnel_id: String,
+    token: String,
+    target: String,
+    direct_relay: Option<DirectRelay>,
+) {
     let client = reqwest::Client::new();
+    let mut use_direct = direct_relay.is_some();
     loop {
+        let candidate = direct_relay.as_ref().filter(|_| use_direct);
+        let relay_url = candidate
+            .map(|value| value.url.as_str())
+            .unwrap_or(&relay);
         let endpoint = format!(
             "{}?tunnel={}&token={}",
-            relay,
+            relay_url,
             url::form_urlencoded::byte_serialize(tunnel_id.as_bytes()).collect::<String>(),
             url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>()
         );
@@ -235,10 +301,29 @@ async fn run_agent(relay: String, tunnel_id: String, token: String, target: Stri
                 continue;
             }
         };
-        let Ok((socket, _)) = tokio_tungstenite::connect_async(connect_request).await else {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            continue;
+        let connection = connect_agent_relay(connect_request, candidate).await;
+        let (socket, _) = match connection {
+            Ok(socket) => socket,
+            Err(error) => {
+                // 连接失败必须留痕：静默重试会让"agent 未连接"完全无法定位（TLS/认证/网络各有不同原因）。
+                eprintln!(
+                    "[agent] {tunnel_id}: {}连接失败: {error}",
+                    if use_direct { "直连" } else { "配置" }
+                );
+                if use_direct {
+                    use_direct = false;
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                use_direct = direct_relay.is_some();
+                continue;
+            }
         };
+        let connected_at = Instant::now();
+        eprintln!(
+            "[agent] {tunnel_id}: {}",
+            if use_direct { "直连加密入口" } else { "配置入口" }
+        );
         let (mut writer, mut reader) = socket.split();
         let (relay_sender, mut relay_outbound) = mpsc::unbounded_channel::<Message>();
         let relay_writer = tauri::async_runtime::spawn(async move {
@@ -250,7 +335,18 @@ async fn run_agent(relay: String, tunnel_id: String, token: String, target: Stri
         });
         let mut local_websockets =
             HashMap::<String, mpsc::UnboundedSender<serde_json::Value>>::new();
-        while let Some(Ok(message)) = reader.next().await {
+        // 服务端以 1008 关闭表示凭据已失效（token 被重新签发）或本连接已被更新的 agent 接管。
+        // 这两种情况重试都不会成功：前者永远被拒，后者会与新连接互相顶替形成抖动，
+        // 因此必须识别并退出循环，不能像普通断线那样无条件重连。
+        let mut rejected = false;
+        while let Some(result) = reader.next().await {
+            let Ok(message) = result else {
+                break;
+            };
+            if let Message::Close(frame) = &message {
+                rejected = frame.as_ref().map(|value| u16::from(value.code)) == Some(1008);
+                break;
+            }
             if !message.is_text() {
                 continue;
             }
@@ -303,6 +399,17 @@ async fn run_agent(relay: String, tunnel_id: String, token: String, target: Stri
         }
         local_websockets.clear();
         relay_writer.abort();
+        if rejected {
+            eprintln!(
+                "[agent] {tunnel_id}: 被服务端拒绝（1008 凭据失效或已被新连接接管），停止重连"
+            );
+            return;
+        }
+        if use_direct && connected_at.elapsed() < Duration::from_secs(5) {
+            use_direct = false;
+            continue;
+        }
+        use_direct = direct_relay.is_some();
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
 }
@@ -328,7 +435,7 @@ async fn handle_http_request(
         .unwrap_or("GET")
         .parse()
         .unwrap_or(reqwest::Method::GET);
-    let Ok(url) = reqwest::Url::parse(&target).and_then(|base| base.join(path)) else {
+    let Some(url) = resolve_forward_url(&target, path) else {
         return;
     };
     let body = request
@@ -419,8 +526,8 @@ async fn run_local_websocket(
         .get("path")
         .and_then(|value| value.as_str())
         .unwrap_or("/");
-    let Ok(mut url) = reqwest::Url::parse(&target).and_then(|base| base.join(path)) else {
-        send_local_websocket_close(&relay_sender, &id, 1011, "invalid local websocket URL");
+    let Some(mut url) = resolve_forward_url(&target, path) else {
+        send_local_websocket_close(&relay_sender, &id, 1011, "unsafe forward path");
         return;
     };
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
@@ -455,7 +562,7 @@ async fn run_local_websocket(
             }
         }
     }
-    let Ok((local, _)) = tokio_tungstenite::connect_async(local_request).await else {
+    let Ok((local, _)) = tokio_tungstenite::connect_async_with_config(local_request, None, true).await else {
         send_local_websocket_close(&relay_sender, &id, 1011, "local websocket unavailable");
         return;
     };
@@ -562,12 +669,127 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
+// 转发路径必须是以单个 `/` 开头的站点内路径。`//host/path`、`/\host` 之类的值会被 URL 解析器
+// 当作「更换主机」，让公网请求绕过隧道绑定的本地目标去访问本机任意端口、内网或公网地址。
+fn safe_forward_path(value: &str) -> Option<&str> {
+    let raw = if value.is_empty() { "/" } else { value };
+    if !raw.starts_with('/') || raw.starts_with("//") {
+        return None;
+    }
+    if raw.contains('\\') || raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(raw)
+}
+
+// 在 base 上解析转发目标；路径非法或解析结果脱离了 base 绑定的 origin 时返回 None。
+fn resolve_forward_url(base: &str, path: &str) -> Option<reqwest::Url> {
+    let raw = safe_forward_path(path)?;
+    let base_url = reqwest::Url::parse(base).ok()?;
+    let target = base_url.join(raw).ok()?;
+    // 纵深防御：即便路径校验被绕过，也绝不允许跨 origin 转发。
+    if target.origin() != base_url.origin() {
+        return None;
+    }
+    Some(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         insert_response_header, normalize_loaded_preferences, uses_bundled_local_api,
         with_local_api_token, DesktopPreferences,
     };
+
+    #[tokio::test]
+    async fn direct_relay_rejects_unencrypted_connections() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let direct = super::DirectRelay {
+            url: "ws://localhost/relay".into(),
+            address: "127.0.0.1:1".into(),
+        };
+        let result = super::connect_agent_relay(
+            direct.url.as_str().into_client_request().unwrap(),
+            Some(&direct),
+        ).await;
+        assert!(matches!(result, Err(message) if message == "direct relay requires TLS"));
+    }
+
+    #[tokio::test]
+    async fn agent_falls_back_when_direct_tls_handshake_fails() {
+        use tokio::io::AsyncReadExt;
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap().to_string();
+        let broken_tls = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut first_byte = [0];
+            stream.read_exact(&mut first_byte).await.unwrap();
+            assert_eq!(first_byte[0], 0x16); // 必须先发 TLS 握手，而不是明文认证。
+        });
+        let fallback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_address = fallback.local_addr().unwrap();
+        let agent = tokio::spawn(super::run_agent(
+            format!("ws://{fallback_address}/relay"),
+            "probe-tunnel".into(),
+            "probe-token".into(),
+            "http://127.0.0.1:1".into(),
+            Some(super::DirectRelay { url: "wss://localhost/relay".into(), address: origin_address }),
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            let (stream, _) = fallback.accept().await.unwrap();
+            tokio_tungstenite::accept_hdr_async(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                assert_eq!(request.headers()["authorization"], "Bearer probe-token");
+                assert_eq!(request.uri().path(), "/relay");
+                Ok(response)
+            }).await.unwrap()
+        }).await;
+        agent.abort();
+        broken_tls.abort();
+        assert!(result.is_ok(), "直连 TLS 失败后应连接配置入口");
+    }
+
+    #[test]
+    fn safe_forward_path_accepts_in_site_paths() {
+        use super::safe_forward_path;
+        for path in ["/", "/a", "/a/b?c=1", "/api/tunnels", "/a/../b"] {
+            assert_eq!(safe_forward_path(path), Some(path), "应放行 {path}");
+        }
+        assert_eq!(safe_forward_path(""), Some("/"));
+    }
+
+    #[test]
+    fn safe_forward_path_rejects_host_switching_paths() {
+        use super::safe_forward_path;
+        // 这些值会被 URL 解析器当作「更换主机」，让公网请求绕过隧道绑定的本地目标。
+        for path in [
+            "//evil.example/x",
+            "//127.0.0.1:19002/x",
+            "//localhost:18788/api/tunnels",
+            "http://evil.example/x",
+            "/\\evil.example",
+            "/a\\b",
+            "a/b",
+            "/a\nx",
+            "/a\u{0}b",
+        ] {
+            assert_eq!(safe_forward_path(path), None, "应拒绝 {path:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_forward_url_stays_within_tunnel_target_origin() {
+        use super::resolve_forward_url;
+        let target = "http://127.0.0.1:19001";
+        assert_eq!(
+            resolve_forward_url(target, "/ok").map(|url| url.to_string()),
+            Some("http://127.0.0.1:19001/ok".to_string())
+        );
+        for path in ["//127.0.0.1:19002/x", "//example.com/", "//localhost:18788/api/tunnels"] {
+            assert!(resolve_forward_url(target, path).is_none(), "应拒绝 {path}");
+        }
+    }
 
     #[test]
     fn serializes_single_headers_as_strings_and_repeated_headers_as_arrays() {
@@ -703,7 +925,9 @@ fn start_local_api(
     let node = bundled_dir.join("node.exe");
     let entry = bundled_dir.join("server").join("dist").join("index.js");
     if !node.exists() || !entry.exists() {
-        // Development mode uses the workspace's concurrently-managed API process.
+        let log_dir = app.path().app_data_dir().map_err(|error| format!("无法定位应用数据目录: {error}"))?;
+        fs::create_dir_all(&log_dir).map_err(|error| format!("无法创建应用数据目录: {error}"))?;
+        append_local_api_log(&log_dir, &format!("本地控制中心运行资源未准备完成，等待后续请求补启动：{}", bundled_dir.display()));
         return Ok(None);
     }
     let data_dir = node_compatible_path(
@@ -720,13 +944,13 @@ fn start_local_api(
             let authorized = probe_local_api("/api/tunnels", Some(admin_token))
                 .map(|response| response.contains(" 200 "))
                 .unwrap_or(false);
-            if authorized {
+            if authorized && response.contains("\"database\":\"mysql\"") {
                 append_local_api_log(&data_dir, "8787 端口已有兼容的本地控制中心在运行，直接复用");
                 return Ok(None);
             }
             append_local_api_log(
                 &data_dir,
-                "检测到携带旧 token 的残留控制中心进程，正在结束并重新启动",
+                "检测到旧令牌或旧 SQLite 控制中心，正在结束并启动 MySQL 控制中心",
             );
             terminate_stale_local_api();
             std::thread::sleep(Duration::from_millis(600));
@@ -745,13 +969,18 @@ fn start_local_api(
         .map_err(|error| format!("无法初始化本地控制中心日志: {error}"))?;
     let mut command = Command::new(node);
     command
+        .arg("--env-file-if-exists")
+        .arg(data_dir.join("local-api.env"))
         .arg(entry)
         .current_dir(&bundled_dir)
         .env("PORT", LOCAL_API_PORT.to_string())
         .env("BIND_HOST", "127.0.0.1")
-        .env("NEXIOUS_DB_PATH", data_dir.join("nexious.db"))
+        .env_remove("NEXIOUS_DB_PATH")
+        .env_remove("NEXIOUS_SQLITE_TEST")
+        .env_remove("NEXIOUS_NODE_CONTROLLER")
+        .env("NEXIOUS_DB_DRIVER", "mysql")
+        .env("NEXIOUS_EMBEDDED", "1")
         .env("NEXIOUS_ADMIN_TOKEN", admin_token)
-        .env("NEXIOUS_SKIP_SEED", "1")
         .env("NEXIOUS_MAX_BODY_MB", settings.max_body_mb.to_string())
         .env(
             "NEXIOUS_LOG_RETENTION_DAYS",
@@ -797,6 +1026,39 @@ fn start_local_api(
         }
     });
     Ok(Some(child))
+}
+
+fn ensure_local_api_ready(app: &tauri::AppHandle, settings: &DesktopPreferences) -> Result<(), String> {
+    // 启动检查共用一把锁，多个页面并发请求只会拉起一个主控进程。
+    // 在发送业务请求前等待服务就绪，避免自动重放已经发送的写入。
+    let state = app.state::<LocalApiState>();
+    let mut child = state.0.lock().map_err(|_| "本地控制中心状态不可用".to_string())?;
+    let running = match child.as_mut() {
+        Some(process) => process.try_wait().map_err(|_| "无法检查本地控制中心进程".to_string())?.is_none(),
+        None => false,
+    };
+    if !running {
+        child.take();
+        let token = app.state::<DesktopPreferencesState>().local_api_token.clone();
+        *child = start_local_api(app, &token, settings)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if probe_local_api("/api/health", None).is_some_and(|response|
+            response.contains(" 200 ") && response.contains("\"database\":\"mysql\"")) {
+            return Ok(());
+        }
+        if let Some(process) = child.as_mut() {
+            if process.try_wait().map_err(|_| "无法检查本地控制中心进程".to_string())?.is_some() {
+                child.take();
+                return Err("本机主控启动失败，请检查 MySQL 连接配置及 local-api.log".to_string());
+            }
+        } else {
+            return Err("本机主控运行资源尚未准备完成，请稍后重试；开发模式请先完成运行时构建".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("本机主控尚未就绪，请检查 MySQL 服务及 local-api.log".to_string())
 }
 
 fn stop_local_api(state: &LocalApiState) {
@@ -936,19 +1198,26 @@ fn set_desktop_preferences(
 
 #[tauri::command]
 async fn api_request(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DesktopPreferencesState>,
     api_client: tauri::State<'_, ApiClient>,
     method: String,
     path: String,
     body: Option<serde_json::Value>,
+    // 桌面请求只使用个人账号会话，机器令牌仅用于服务启动与节点同步。
+    token: Option<String>,
+    session_api_url: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let preferences = state
         .value
         .lock()
         .map_err(|_| "桌面设置不可用".to_string())?
         .clone();
-    if preferences.api_token.trim().is_empty() {
-        return Err("请先在偏好设置中填写管理 Token".to_string());
+    let session_token = token.unwrap_or_default();
+    let using_session = !session_token.trim().is_empty();
+    let public_account_api = ["/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/register", "/api/auth/email-code", "/api/auth/captcha", "/api/auth/captcha/verify"].contains(&path.as_str());
+    if !using_session && !public_account_api {
+        return Err(serde_json::json!({"status":401,"message":"请先登录个人账号"}).to_string());
     }
     // 兼容旧版本保存的 `https://host/api`，新版接口路径统一显式包含 `/api`。
     let mut base_url = preferences.api_url.trim_end_matches('/').to_string();
@@ -956,20 +1225,37 @@ async fn api_request(
         base_url.truncate(base_url.len() - 4);
     }
     let url = format!("{}/{}", base_url, path.trim_start_matches('/'));
+    if using_session && session_api_url.as_deref().and_then(|value| secure_session::normalized_endpoint(value).ok()) != Some(secure_session::normalized_endpoint(&preferences.api_url)?) {
+        return Err(serde_json::json!({"status":401,"message":"控制中心已切换，请重新登录"}).to_string());
+    }
+    let endpoint = url::Url::parse(&preferences.api_url).map_err(|_| "控制中心地址无效".to_string())?;
+    let loopback = matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost" | "::1" | "[::1]"));
+    if !loopback && endpoint.scheme() != "https" && (using_session || path.starts_with("/api/auth/")) {
+        return Err("远程账号登录需要 HTTPS，请为控制中心配置证书".to_string());
+    }
+    if uses_bundled_local_api(&preferences.api_url) {
+        let local_settings = preferences.clone();
+        tauri::async_runtime::spawn_blocking(move || ensure_local_api_ready(&app, &local_settings))
+            .await.map_err(|_| "检查本机主控状态失败，请重试".to_string())??;
+    }
     let method = method
         .parse::<reqwest::Method>()
         .map_err(|_| "无效的请求方法".to_string())?;
-    let is_deployment = path.ends_with("/deploy");
+    // 测速要跑满上下行两个方向，单个方向最长 60s，必须比常规请求放得更宽，
+    // 否则桌面端会在服务端还在采样时就判定超时。
+    let is_deployment = path.ends_with("/deploy") || path.ends_with("/reset");
+    let is_speed_test = path.ends_with("/speedtest");
     let timeout = if is_deployment {
         Duration::from_secs(600)
+    } else if is_speed_test {
+        Duration::from_secs(180)
     } else {
         Duration::from_secs(30)
     };
     let client = &api_client.0;
-    let mut request = client
-        .request(method, url)
-        .timeout(timeout)
-        .bearer_auth(preferences.api_token);
+    let credential = session_token.trim();
+    let mut request = client.request(method, url).timeout(timeout);
+    if !credential.trim().is_empty() { request = request.bearer_auth(credential); }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -977,6 +1263,8 @@ async fn api_request(
         if error.is_timeout() {
             if is_deployment {
                 "节点部署等待超时，请检查服务器网络和部署日志".to_string()
+            } else if is_speed_test {
+                "测速超时，请缩小数据量或检查目标服务响应".to_string()
             } else {
                 "控制中心响应超时，请检查网络连接".to_string()
             }
@@ -1000,12 +1288,7 @@ async fn api_request(
             .and_then(|value| value.as_str())
             .unwrap_or("请求失败")
             .to_string();
-        if status == reqwest::StatusCode::UNAUTHORIZED && preferences.api_url == LOCAL_API_URL {
-            return Err(format!(
-                "{message}：本地控制中心 Token 不匹配，请完全退出并重新启动应用"
-            ));
-        }
-        return Err(message);
+        return Err(serde_json::json!({"status":status.as_u16(),"message":message,"code":value.get("code"),"retryAfter":value.get("retryAfter")}).to_string());
     }
     Ok(value)
 }
@@ -1021,6 +1304,7 @@ pub fn run() {
             }
         }))
         .manage(AgentManager::default())
+        .manage(secure_session::AccountSessionState::default())
         .setup(|app| {
             let path = app.path().app_config_dir()?.join("preferences.json");
             let local_token = load_or_create_local_api_token(
@@ -1045,6 +1329,7 @@ pub fn run() {
                 path,
                 local_api_token: local_token,
             });
+            app.manage(secure_session::NodeSecretsState::default());
 
             let show = MenuItem::with_id(app, "show", "打开 Nexious Tunnel", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -1112,8 +1397,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_agent,
             stop_agent,
+            stop_all_agents,
             get_desktop_preferences,
             set_desktop_preferences,
+            secure_session::get_account_session,
+            secure_session::save_account_session,
+            secure_session::clear_account_session,
+            secure_session::get_node_password,
+            secure_session::save_node_password,
+            secure_session::clear_node_password,
             api_request
         ])
         .build(tauri::generate_context!())

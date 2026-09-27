@@ -32,6 +32,7 @@ import { api } from "../api/client";
 import type { AccessLog } from "../types";
 import PageHeader from "../components/PageHeader.vue";
 import StateBlock from "../components/StateBlock.vue";
+import { currentThemeStyle, themeLight } from "../theme";
 
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent]);
 const router = useRouter(),
@@ -72,11 +73,15 @@ const option = computed(() => ({
   grid: { left: 10, right: 12, top: 18, bottom: 6, containLabel: true },
   tooltip: {
     trigger: "axis",
-    backgroundColor: "#1a1f22",
-    borderColor: "#343b42",
+    backgroundColor: themeLight.value
+      ? currentThemeStyle.value.light.surfaceRaised
+      : currentThemeStyle.value.dark.surfaceRaised,
+    borderColor: themeLight.value
+      ? currentThemeStyle.value.light.border
+      : currentThemeStyle.value.dark.border,
     borderRadius: 6,
     padding: [8, 12],
-    textStyle: { color: "#eef2f0", fontSize: 12 }
+    textStyle: { color: themeLight.value ? currentThemeStyle.value.light.textMuted : currentThemeStyle.value.dark.textSecondary, fontSize: 12 }
   },
   xAxis: {
     type: "category",
@@ -93,7 +98,7 @@ const option = computed(() => ({
       color: "#7f8a86",
       formatter: (v: number) => `${(v / 1e6).toFixed(0)}M`
     },
-    splitLine: { lineStyle: { color: "#252b2e", type: "dashed" } }
+    splitLine: { lineStyle: { color: themeLight.value ? currentThemeStyle.value.light.border : currentThemeStyle.value.dark.border, type: "dashed" } }
   },
   series: [
     {
@@ -102,7 +107,13 @@ const option = computed(() => ({
       smooth: 0.35,
       symbol: "none",
       data: (dashboard.data.value?.series || []).map((p) => p.inbound),
-      lineStyle: { color: "#39d98a", width: 2 }
+      // 强调色跟随主题风格预设：浅色下用深色档保证白底可读性
+      lineStyle: {
+        color: themeLight.value
+          ? currentThemeStyle.value.light.accent
+          : currentThemeStyle.value.dark.accent,
+        width: 2
+      }
     },
     {
       name: "上传",
@@ -172,13 +183,14 @@ const logColumns: DataTableColumns<AccessLog> = [
     render: (row) => h("code", row.client_ip)
   },
   {
-    title: "访问入口",
+    title: "访问地址",
     key: "path",
-    minWidth: 220,
+    minWidth: 260,
+    // 展示用户实际访问的完整地址；服务端未补全时退回路径。
     render: (row) =>
       h("div", { class: "log-request" }, [
         h("b", row.method),
-        h("code", row.path)
+        h("code", { title: row.access_url || row.path }, row.access_url || row.path)
       ])
   },
   {
@@ -214,7 +226,6 @@ const logColumns: DataTableColumns<AccessLog> = [
 <template>
   <div class="view">
     <PageHeader
-      eyebrow="CONTROL CENTER"
       title="运行总览"
       description="跨网络边界，掌握每一条连接。"
     >
@@ -285,7 +296,6 @@ const logColumns: DataTableColumns<AccessLog> = [
         <section class="chart-section">
           <div class="panel-title">
             <div>
-              <span>NETWORK TRAFFIC</span>
               <h2>网络流量</h2>
             </div>
             <div class="legend">
@@ -305,7 +315,6 @@ const logColumns: DataTableColumns<AccessLog> = [
           <div class="panel">
             <div class="panel-title">
               <div>
-                <span>LIVE TUNNELS</span>
                 <h2>实时连接</h2>
               </div>
               <button @click="router.push('/tunnels')">查看全部 →</button>
@@ -365,7 +374,6 @@ const logColumns: DataTableColumns<AccessLog> = [
       <section class="logs-section">
         <div class="panel-title">
           <div>
-            <span>ACCESS OBSERVATORY</span>
             <h2>访问日志</h2>
           </div>
           <n-button
@@ -483,8 +491,8 @@ const logColumns: DataTableColumns<AccessLog> = [
   height: 20px;
 }
 .metric-green .metric-icon {
-  background: #12261d;
-  color: #39d98a;
+  background: var(--accent-soft-bg);
+  color: var(--accent);
 }
 .metric-amber .metric-icon {
   background: #282115;
@@ -495,7 +503,7 @@ const logColumns: DataTableColumns<AccessLog> = [
   color: #6ab8f7;
 }
 .metric-slate .metric-icon {
-  background: #252b2e;
+  background: var(--border-subtle);
   color: #cdd6d1;
 }
 .metric-body span {
@@ -559,7 +567,7 @@ const logColumns: DataTableColumns<AccessLog> = [
   color: var(--text-muted, #69736f);
 }
 .chart-empty svg {
-  color: var(--accent, #39d98a);
+  color: var(--accent);
   opacity: 0.75;
 }
 .chart-empty b {
@@ -595,7 +603,7 @@ const logColumns: DataTableColumns<AccessLog> = [
   place-items: center;
   border: 1px solid #334039;
   color: var(--accent);
-  background: var(--accent-dim, rgba(57, 217, 138, 0.08));
+  background: var(--accent-dim);
   border-radius: 8px;
 }
 .notice > div:nth-child(2) {
@@ -655,8 +663,8 @@ const logColumns: DataTableColumns<AccessLog> = [
 }
 :deep(.log-request b) {
   flex: none;
-  font: 600 10px "IBM Plex Mono";
-  color: #39d98a;
+  font: 600 10px ui-monospace, Consolas, monospace;
+  color: var(--accent);
 }
 :deep(.log-request code) {
   overflow: hidden;
@@ -667,14 +675,14 @@ const logColumns: DataTableColumns<AccessLog> = [
 /* ── Light Theme ── */
 .theme-light .metrics > .metric-card {
   background: #fff;
-  border-right-color: #e1e6e3;
+  border-right-color: var(--border-subtle);
 }
 .theme-light .metrics > .metric-card:hover {
-  background: #f8faf9;
+  background: var(--surface-hover);
 }
 .theme-light .metric-green .metric-icon {
-  background: #e6f5ec;
-  color: #1d8a56;
+  background: var(--accent-soft-bg);
+  color: var(--accent);
 }
 .theme-light .metric-amber .metric-icon {
   background: #fdf3e2;
@@ -685,45 +693,45 @@ const logColumns: DataTableColumns<AccessLog> = [
   color: #3a7fc4;
 }
 .theme-light .metric-slate .metric-icon {
-  background: #f0f2f1;
+  background: var(--surface-hover);
   color: #3d4541;
 }
 .theme-light .chart-section {
   background: #fff;
-  border-color: #d8dedb;
+  border-color: var(--border);
 }
 .theme-light .chart-empty b {
-  color: #52605a;
+  color: var(--text-secondary);
 }
 .theme-light .conn-copy {
   color: #52605a !important;
 }
 .theme-light .conn-copy:hover {
-  color: #239b61 !important;
+  color: var(--accent) !important;
 }
 .theme-light .notice {
   background: #fff;
-  border-color: #d8dedb;
+  border-color: var(--border);
 }
 .theme-light .notice-icon {
-  background: #edf7f1;
-  border-color: #b9d8c7;
+  background: var(--accent-soft-bg);
+  border-color: var(--accent-soft-border);
 }
 .theme-light .logs-section {
   background: #fff;
-  border-color: #d8dedb;
+  border-color: var(--border);
 }
 .theme-light .log-toolbar,
 .theme-light .log-pagination {
-  border-color: #e1e6e3;
+  border-color: var(--border-subtle);
 }
 .theme-light .log-pagination > span {
-  color: #68736e;
+  color: var(--text-secondary);
 }
 .theme-light .dashboard-grid .chart-section,
 .theme-light .dashboard-grid .connection-panel .panel {
   background: #fff;
-  border-color: #d8dedb;
+  border-color: var(--border);
 }
 
 /* ── Responsive ── */

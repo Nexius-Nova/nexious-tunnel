@@ -5,7 +5,7 @@
   "packageManager": "pnpm@9.0.2",
   "scripts": {
     "dev": "concurrently -k -n API,WEB -c yellow,cyan \"pnpm --filter @nexious/server dev\" \"pnpm --filter @nexious/desktop dev\"",
-    "dev:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-stale-desktop.ps1 && concurrently -k -n API,TAURI -c yellow,green \"pnpm --filter @nexious/server dev\" \"pnpm --filter @nexious/desktop tauri dev\"",
+    "dev:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-stale-desktop.ps1 && pnpm --filter @nexious/desktop tauri dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "start": "pnpm --filter @nexious/server start"
