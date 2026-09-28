@@ -88,6 +88,8 @@ export interface Preferences {
   maxBodyMb: number;
   logRetentionDays: number;
   trafficRetentionDays: number;
+  // 偏好结构版本（桌面端内部使用）：≥3 表示当前版本配置，加载时不再做默认地址迁移。
+  schemaVersion?: number;
 }
 export interface TunnelInput {
   name: string;

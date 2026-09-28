@@ -7,6 +7,7 @@ import {
   isStaticAssetPath,
   normalizeHost,
   originAllowed,
+  reservedSubdomains,
   resolveClientIp,
   safeForwardPath,
   staticAssetConditions,
@@ -136,4 +137,12 @@ test("forwardUrlStaysOnOrigin 兜底拦截跨 origin 的解析结果", () => {
   assert.equal(forwardUrlStaysOnOrigin("http://127.0.0.1:19001", "//example.com/"), false);
   assert.equal(forwardUrlStaysOnOrigin("http://127.0.0.1:19001", "//localhost:18788/api/tunnels"), false);
   assert.equal(forwardUrlStaysOnOrigin("not a base", "/ok"), false);
+});
+
+test("隧道子域名保留字：api 与 node 被占用，普通标签不受影响", () => {
+  assert.equal(reservedSubdomains.has("api"), true);
+  assert.equal(reservedSubdomains.has("node"), true);
+  assert.equal(reservedSubdomains.has("demo"), false);
+  assert.equal(reservedSubdomains.has("node-app"), false);
+  assert.equal(reservedSubdomains.has("API"), false);
 });

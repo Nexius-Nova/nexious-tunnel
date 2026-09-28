@@ -25,6 +25,22 @@ use tokio_tungstenite::tungstenite::{
 };
 
 const LOCAL_API_URL: &str = "http://127.0.0.1:8787";
+// 出厂默认连接官方控制中心。直连服务器 IP（TLS 不发 SNI），绕开运营商按
+// SNI 匹配未备案域名的拦截；服务器证书由专用 CA 签发（SAN 含服务器 IP），
+// CA 证书内置下方，作为直连入口的信任锚。域名入口（cc.nexious-ppt.xyz）
+// 在域名完成 ICP 备案后可作为后备入口恢复。
+const DEFAULT_API_URL: &str = "https://8.134.156.74:8443";
+// 官方控制中心专用 CA 证书（仅公钥；签发私钥只存在于服务器）。
+// 注意：该文件必须是无 BOM 的纯 ASCII PEM（include_bytes! 原样嵌入，
+// 带 BOM/CRLF 的副本会导致 rustls 证书解析异常）。
+const OFFICIAL_CA_CERT: &[u8] = include_bytes!("../certs/ca.crt");
+// 历史出厂默认：内置本地服务、官方域名入口两代。加载时一次性迁移到 DEFAULT_API_URL。
+const LEGACY_DEFAULT_API_URLS: [&str; 4] = [
+    "http://127.0.0.1:8787",
+    "http://localhost:8787",
+    "https://cc.nexious-ppt.xyz",
+    "https://cc.nexious-ppt.xyz:8443",
+];
 mod secure_session;
 const LOCAL_API_PORT: u16 = 8787;
 // 隧道响应体上限：整包 base64+JSON 转发在内存中完成，必须限制大小防止打爆内存。
@@ -51,6 +67,11 @@ struct DesktopPreferences {
     max_body_mb: u32,
     log_retention_days: u32,
     traffic_retention_days: u32,
+    // 偏好结构版本：0/1/2=历史出厂配置（默认地址经历本地服务 → 官方域名入口
+    // 两代），≥3=当前版本（IP 直连入口）。字段级 serde(default) 让旧文件缺该
+    // 字段时取 0，触发默认地址迁移。
+    #[serde(default)]
+    schema_version: u32,
 }
 
 impl Default for DesktopPreferences {
@@ -58,11 +79,12 @@ impl Default for DesktopPreferences {
         Self {
             auto_start: false,
             minimize_to_tray: true,
-            api_url: "http://127.0.0.1:8787".to_string(),
+            api_url: DEFAULT_API_URL.to_string(),
             api_token: String::new(),
             max_body_mb: 25,
             log_retention_days: 30,
             traffic_retention_days: 90,
+            schema_version: 3,
         }
     }
 }
@@ -74,6 +96,16 @@ struct DesktopPreferencesState {
 }
 
 struct ApiClient(reqwest::Client);
+
+// 信任官方控制中心自签 CA 的 API 客户端；在系统根证书之外追加，
+// 访问其他 HTTPS 地址的行为不受影响。
+fn build_api_client() -> reqwest::Client {
+    let certificate = reqwest::Certificate::from_pem(OFFICIAL_CA_CERT).expect("内置 CA 证书无效");
+    reqwest::Client::builder()
+        .add_root_certificate(certificate)
+        .build()
+        .expect("无法构建 API 客户端")
+}
 
 // 本地控制中心的管理 token 不再硬编码在二进制里，而是首次启动时随机生成并
 // 保存到用户配置目录，避免本机低权限进程从安装包中直接读出固定口令。
@@ -233,6 +265,34 @@ fn stop_all_agents(manager: tauri::State<'_, AgentManager>) -> Result<(), String
     Ok(())
 }
 
+// 解析单个 PEM 证书为 DER。内置 CA 证书格式受控（无 BOM 的纯 ASCII PEM）。
+fn pem_certificate_der(pem: &[u8]) -> Option<rustls::pki_types::CertificateDer<'static>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    let begin = text.find("-----BEGIN CERTIFICATE-----")? + "-----BEGIN CERTIFICATE-----".len();
+    let end = text.find("-----END CERTIFICATE-----")?;
+    let body: String = text[begin..end].chars().filter(|c| !c.is_whitespace()).collect();
+    let der = BASE64.decode(body).ok()?;
+    Some(rustls::pki_types::CertificateDer::from(der))
+}
+
+// relay 连接的 TLS 配置：webpki 公共根之外追加内置官方 CA，使 agent 能验证控制中心
+// 的 IP 直连自签证书，信任范围与 API 客户端（reqwest）保持一致。
+// 显式指定 ring provider，不依赖进程级默认（避免多 provider 时的歧义 panic）。
+fn relay_tls_connector() -> tokio_tungstenite::Connector {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(certificate) = pem_certificate_der(OFFICIAL_CA_CERT) {
+        let _ = roots.add(certificate);
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .expect("TLS 协议版本无效")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config))
+}
+
 async fn connect_agent_relay(
     request: tokio_tungstenite::tungstenite::http::Request<()>,
     direct_relay: Option<&DirectRelay>,
@@ -252,14 +312,24 @@ async fn connect_agent_relay(
                 .await
                 .map_err(|error| error.to_string())?;
             stream.set_nodelay(true).map_err(|error| error.to_string())?;
-            // 默认 TLS 连接器继续校验 URL 域名与受信任证书，IP 仅用于 TCP 连接。
-            tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
-                .await
-                .map_err(|error| error.to_string())
+            // TLS 仍按 URL 主机名校验证书（IP 入口校验 IP SAN），地址仅用于 TCP 连接。
+            tokio_tungstenite::client_async_tls_with_config(
+                request,
+                stream,
+                None,
+                Some(relay_tls_connector()),
+            )
+            .await
+            .map_err(|error| error.to_string())
         } else {
-            tokio_tungstenite::connect_async_with_config(request, None, true)
-                .await
-                .map_err(|error| error.to_string())
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                true,
+                Some(relay_tls_connector()),
+            )
+            .await
+            .map_err(|error| error.to_string())
         }
     })
     .await
@@ -697,8 +767,9 @@ fn resolve_forward_url(base: &str, path: &str) -> Option<reqwest::Url> {
 #[cfg(test)]
 mod tests {
     use super::{
-        insert_response_header, normalize_loaded_preferences, uses_bundled_local_api,
-        with_local_api_token, DesktopPreferences,
+        build_api_client, insert_response_header, normalize_loaded_preferences,
+        uses_bundled_local_api, with_local_api_token, DesktopPreferences, DEFAULT_API_URL,
+        LOCAL_API_URL,
     };
 
     #[tokio::test]
@@ -823,17 +894,94 @@ mod tests {
 
     #[test]
     fn restores_bundled_token_only_for_local_control_center() {
-        let preferences = with_local_api_token(DesktopPreferences::default(), "generated-token-0123456789abcdef");
-
-        assert_eq!(preferences.api_token, "generated-token-0123456789abcdef");
+        let local = with_local_api_token(
+            DesktopPreferences {
+                api_url: LOCAL_API_URL.to_string(),
+                ..DesktopPreferences::default()
+            },
+            "generated-token-0123456789abcdef",
+        );
+        assert_eq!(local.api_token, "generated-token-0123456789abcdef");
         let remote = with_local_api_token(
             DesktopPreferences {
                 api_url: "https://relay.example.com/api".to_string(),
                 ..DesktopPreferences::default()
             },
-            "generated-token-0123456789abcdef"
+            "generated-token-0123456789abcdef",
         );
         assert_eq!(remote.api_token, "");
+        // 出厂默认即官方控制中心，不注入本地令牌。
+        let default_remote = with_local_api_token(
+            DesktopPreferences::default(),
+            "generated-token-0123456789abcdef",
+        );
+        assert_eq!(default_remote.api_token, "");
+    }
+
+    #[test]
+    fn migrates_legacy_default_to_official_control_center() {
+        // 旧本地默认（schema 0）迁移到官方控制中心。
+        let migrated = normalize_loaded_preferences(DesktopPreferences {
+            api_url: "http://127.0.0.1:8787".to_string(),
+            schema_version: 0,
+            ..DesktopPreferences::default()
+        });
+        assert_eq!(migrated.api_url, DEFAULT_API_URL);
+        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.api_token, "");
+
+        let also_legacy = normalize_loaded_preferences(DesktopPreferences {
+            api_url: "http://localhost:8787".to_string(),
+            schema_version: 0,
+            ..DesktopPreferences::default()
+        });
+        assert_eq!(also_legacy.api_url, DEFAULT_API_URL);
+
+        // 官方域名入口两代（未带端口 / 8443 域名形式）都迁移到当前 IP 直连入口。
+        let previous_official = normalize_loaded_preferences(DesktopPreferences {
+            api_url: "https://cc.nexious-ppt.xyz".to_string(),
+            schema_version: 1,
+            ..DesktopPreferences::default()
+        });
+        assert_eq!(previous_official.api_url, DEFAULT_API_URL);
+        assert_eq!(previous_official.schema_version, 3);
+
+        let previous_official_port = normalize_loaded_preferences(DesktopPreferences {
+            api_url: "https://cc.nexious-ppt.xyz:8443".to_string(),
+            schema_version: 2,
+            ..DesktopPreferences::default()
+        });
+        assert_eq!(previous_official_port.api_url, DEFAULT_API_URL);
+
+        // 当前版本（schema ≥3）的地址不再被改写。
+        let current = normalize_loaded_preferences(DesktopPreferences {
+            api_url: "http://127.0.0.1:8787".to_string(),
+            schema_version: 3,
+            ..DesktopPreferences::default()
+        });
+        assert_eq!(current.api_url, "http://127.0.0.1:8787");
+    }
+
+    // 实测桌面端 TLS 栈（rustls）经内置 CA 直连官方控制中心 IP 入口。
+    // 该路径 TLS 不发 SNI，可绕开运营商对未备案域名的 SNI 拦截。
+    // 依赖真实网络与服务器状态，默认忽略：cargo test probes_official -- --ignored
+    #[test]
+    #[ignore]
+    fn probes_official_control_center_via_rustls() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+        let response = runtime
+            .block_on(async {
+                build_api_client()
+                    .get("https://8.134.156.74:8443/api/auth/status")
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+            })
+            .expect("rustls request failed");
+        assert!(response.status().is_success(), "status: {}", response.status());
     }
 
     #[test]
@@ -879,6 +1027,15 @@ fn normalize_loaded_preferences(mut preferences: DesktopPreferences) -> DesktopP
     if preferences.api_url.is_empty() {
         preferences.api_url = DesktopPreferences::default().api_url;
     }
+    // 一次性迁移：历史出厂默认（内置本地服务 / 官方域名入口两代）统一迁到当前默认。
+    // 设置页已不提供地址编辑入口，历史默认地址只可能来自出厂配置或历史版本；
+    // schema_version ≥3 的配置视为当前版本产物，不再改写。
+    if preferences.schema_version < 3 && LEGACY_DEFAULT_API_URLS.contains(&preferences.api_url.as_str()) {
+        preferences.api_url = DEFAULT_API_URL.to_string();
+        // 旧本地令牌对远程控制中心无意义，随迁移一并清除。
+        preferences.api_token = String::new();
+    }
+    preferences.schema_version = preferences.schema_version.max(3);
     preferences
 }
 
@@ -1157,6 +1314,8 @@ fn set_desktop_preferences(
         return Err("主控制中心 API 地址必须是有效的 HTTP 或 HTTPS 地址".to_string());
     }
     preferences.api_token = preferences.api_token.trim().to_string();
+    // 保存即视为用户已显式确认地址，抬高版本标记，防止之后加载时被默认地址迁移改写。
+    preferences.schema_version = 3;
     if preferences.api_url == LOCAL_API_URL {
         preferences.api_token = state.local_api_token.clone();
     }
@@ -1317,7 +1476,7 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(move || {
                 let _ = sync_auto_start(auto_start);
             });
-            app.manage(ApiClient(reqwest::Client::new()));
+            app.manage(ApiClient(build_api_client()));
             let local_api = if use_bundled_api {
                 start_local_api(app.handle(), &local_token, &preferences)?
             } else {

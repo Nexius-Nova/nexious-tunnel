@@ -52,6 +52,7 @@ import {
   isStaticAssetPath,
   normalizeHost,
   originAllowed,
+  reservedSubdomains,
   resolveClientIp,
   safeForwardPath,
   staticAssetConditions,
@@ -221,7 +222,8 @@ const subdomainSchema = z
   .regex(
     /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
     "子域名只能包含小写字母、数字和连字符，且不能以连字符开头或结尾"
-  );
+  )
+  .refine((value) => !reservedSubdomains.has(value), "api 与 node 为平台保留子域名，请更换");
 const tunnelSchema = z
   .object({
     name: z.string().trim().min(2).max(32),
@@ -697,13 +699,18 @@ app.post("/api/tunnels/:id/token", async (req, res) => {
   const nodeRelay=tunnel.controller_url
     ? tunnel.controller_url.replace(/^http/,"ws").replace(/\/api\/?$/,"/relay")
     : null;
-  // 控制中心在本机运行时，agent 改连本机桥接端点、由本机 Node 代连节点：直连节点的 TLS 握手
-  // 在部分网络会被中途重置（rustls 与 schannel 都会，Node/OpenSSL 不会），因此不再下发直连参数。
-  const bridgeRelay = !isNodeController && nodeRelay ? `ws://127.0.0.1:${port}/relay-bridge` : null;
+  // agent 的 relay 入口基址：远程部署时为控制中心公网入口（RELAY_URL，即 IP 直连证书入口），
+  // 本机运行时（未配置）为本机监听端口。
+  const relayBase = (process.env.RELAY_URL || `ws://127.0.0.1:${port}`).replace(/\/$/, "");
+  // agent 不直连节点 relay，而是连控制中心的桥接端点、由控制中心的 Node 进程代连节点：
+  // 直连节点的 TLS 握手在部分网络会被中途重置（rustls 与 schannel 都会，Node/OpenSSL 不会），
+  // 因此不下发直连参数。远程部署时该基址必须是 agent 可达的公网入口，
+  // 否则 agent 会尝试连它自己的 127.0.0.1 导致永远连不上（表现为"agent 未连接"）。
+  const bridgeRelay = !isNodeController && nodeRelay ? `${relayBase}/relay-bridge` : null;
   res.json({
     token,
     tunnelId: req.params.id,
-    relay: bridgeRelay || nodeRelay || `${process.env.RELAY_URL || "ws://127.0.0.1:8787"}/relay`,
+    relay: bridgeRelay || nodeRelay || `${relayBase}/relay`,
     directRelay: bridgeRelay ? null : directRelayForNode(tunnel.controller_url, tunnel.node_host, tunnel.server_host)
   });
 });

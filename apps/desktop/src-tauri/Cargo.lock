@@ -2159,6 +2159,7 @@ dependencies = [
  "futures-util",
  "rand 0.8.8",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",
@@ -2167,6 +2168,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "url",
+ "webpki-roots 0.26.11",
  "windows-sys 0.61.2",
 ]
 
@@ -3086,6 +3088,7 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

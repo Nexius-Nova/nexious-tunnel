@@ -19,7 +19,7 @@ const loading = ref(true),
 const form = reactive<Preferences>({
   autoStart: false,
   minimizeToTray: true,
-  apiUrl: "http://127.0.0.1:8787",
+  apiUrl: "https://8.134.156.74:8443",
   maxBodyMb: 25,
   logRetentionDays: 30,
   trafficRetentionDays: 90

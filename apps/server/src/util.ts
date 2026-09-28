@@ -9,6 +9,10 @@ export function certificateDomainAllowed(domain: unknown, publicHost: string | u
   return requested === base || (requested.endsWith(`.${base}`) && tunnelDomains.some(value => value.toLowerCase() === requested));
 }
 
+// 平台保留的隧道子域名标签：api.* 为控制中心入口，node.* 为节点域名前缀。
+// 隧道访问域名为 {子域名}.{节点域名}，占用这两个标签会与平台自身域名产生混淆。
+export const reservedSubdomains: ReadonlySet<string> = new Set(["api", "node"]);
+
 export function directRelayForNode(
   controllerUrl: string | null | undefined,
   nodeHost: string | undefined,

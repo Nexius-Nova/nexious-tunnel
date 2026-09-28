@@ -35,7 +35,7 @@ watch(()=>[props.show,props.tunnel] as const,()=>{if(!props.show)return;Object.a
 watch(()=>props.nodes,()=>{if(props.show&&!form.nodeId)form.nodeId=props.nodes.find(n=>n.status==='online')?.id||''})
 const nodeOptions=computed(()=>props.nodes.map(n=>({label:`${n.name}${n.status!=='online'?'（维护中）':''}`,value:n.id,disabled:n.status!=='online'})))
 const accessUrl=computed(()=>{const host=props.nodes.find(n=>n.id===form.nodeId)?.host;return form.domain&&host?`https://${form.domain}.${host}/`:''})
-const rules:FormRules={name:{required:true,min:2,message:'请输入至少 2 个字符的名称',trigger:'blur'},localPort:{type:'number',required:true,message:'请输入本地端口',trigger:['blur','change']},nodeId:{required:true,message:'请选择节点',trigger:'change'},domain:{required:true,trigger:['input','blur'],validator:(_rule,value)=>{if(!value)return new Error('请输入访问子域名');if(!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value))return new Error('仅支持小写字母、数字和连字符');if(takenDomains.value.has(value))return new Error('该节点上此子域名已被使用，点击骰子换一个');return true}}}
+const rules:FormRules={name:{required:true,min:2,message:'请输入至少 2 个字符的名称',trigger:'blur'},localPort:{type:'number',required:true,message:'请输入本地端口',trigger:['blur','change']},nodeId:{required:true,message:'请选择节点',trigger:'change'},domain:{required:true,trigger:['input','blur'],validator:(_rule,value)=>{if(!value)return new Error('请输入访问子域名');if(!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value))return new Error('仅支持小写字母、数字和连字符');if(value==='api'||value==='node')return new Error('api 与 node 为平台保留子域名，请换一个');if(takenDomains.value.has(value))return new Error('该节点上此子域名已被使用，点击骰子换一个');return true}}}
 async function submit(){form.domain=form.domain?.trim().toLowerCase()||null;try{await formRef.value?.validate()}catch{return}emit('submit',{...form,domain:form.domain})}
 </script>
 <template>
@@ -50,7 +50,7 @@ async function submit(){form.domain=form.domain?.trim().toLowerCase()||null;try{
       <n-form-item label="本地端口" path="localPort"><n-input-number v-model:value="form.localPort" :min="1" :max="65535" style="width:100%" placeholder="3000"/></n-form-item>
       <n-form-item label="访问子域名" path="domain">
         <div class="domain-field">
-          <n-input v-model:value="form.domain" maxlength="63" placeholder="demo" @update:value="onDomainInput">
+          <n-input v-model:value="form.domain" maxlength="63" placeholder="myapp" @update:value="onDomainInput">
             <template #suffix>
               <n-tooltip>
                 <template #trigger>

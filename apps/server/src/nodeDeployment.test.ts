@@ -22,8 +22,9 @@ test("部署配置严格检查管理令牌与端口", () => {
     assert.equal(parseRemoteConfiguration(value), null);
 });
 test("优先保留节点自己的 HTTPS 入口，不采用其他域名或 URL 凭据", () => {
+  // preferred 允许历史遗留的 demo.* 入口（以基础域名为后缀即可），硬编码候选已随域名改名从 demo.* 切换为 node.*
   assert.deepEqual(controllerCandidates("203.0.113.9", 8788, "example.com", "https://demo.example.com/api"),
-    ["https://demo.example.com/api", "https://example.com/api", "http://example.com/api", "http://demo.example.com/api", "http://203.0.113.9:8788/api"]);
+    ["https://demo.example.com/api", "https://example.com/api", "https://node.example.com/api", "http://example.com/api", "http://node.example.com/api", "http://203.0.113.9:8788/api"]);
   assert.equal(controllerCandidates("203.0.113.9", 8788, "example.com", "http://203.0.113.9:8788/api")[0], "https://example.com/api");
   for (const value of ["https://other.example/api", "https://example.com.attacker.test/api", "https://user:secret@example.com/api"])
     assert.equal(controllerCandidates("203.0.113.9", 8788, "example.com", value).includes(value), false);

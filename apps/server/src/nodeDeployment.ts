@@ -1,6 +1,6 @@
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { createConnection, isIP } from "node:net";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,13 +19,22 @@ export function redactDeploymentError(value: string, secrets: string[]): string 
     .replace(/("(?:agent_token|controller_token|password|token)"\s*:\s*")[^"]+/gi, "$1[已隐藏]").slice(-2000);
 }
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-const sourceFiles = ["index.ts", "db.ts", "database.ts", "mysqlSchema.ts", "accountSchema.ts", "auth.ts", "accounts.ts", "verification.ts", "membership.ts", "nodeDeployment.ts", "nodeController.ts", "proxyHeaders.ts", "util.ts"] as const;
+// 源码目录识别哨兵：仅用于定位控制中心源码目录，不是上传清单。
+const sentinelFiles = ["index.ts", "db.ts", "util.ts"] as const;
+// 节点部署上传清单：动态收集源码目录下全部非测试 TS 文件。
+// 禁止改回硬编码清单——billing/alipay 等新模块曾因清单遗漏导致节点启动
+// ERR_MODULE_NOT_FOUND 并触发部署回滚。
+export function listSourceFiles(sourceRoot: string): string[] {
+  return readdirSync(sourceRoot)
+    .filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"))
+    .sort();
+}
 export function resolveControllerSourceRoot(
   moduleRoot = resolve(fileURLToPath(new URL(".", import.meta.url))), workingDirectory = process.cwd()
 ): string | null {
   const candidates = [moduleRoot, resolve(moduleRoot, "../src"), resolve(workingDirectory, "apps/server/src"),
     resolve(workingDirectory, "server/src"), resolve(workingDirectory, "resources/server/src")];
-  return [...new Set(candidates)].find((candidate) => sourceFiles.every((file) => existsSync(resolve(candidate, file)))) || null;
+  return [...new Set(candidates)].find((candidate) => sentinelFiles.every((file) => existsSync(resolve(candidate, file)))) || null;
 }
 type TcpReachability = "open" | "refused" | "timeout" | "unreachable" | "dns";
 // 握手超时既可能是端口被防火墙拦截，也可能是端口通但 sshd 未完成协议协商，
@@ -169,7 +178,7 @@ export function controllerCandidates(serverHost: string, port: number, publicHos
         ["http:", "https:"].includes(url.protocol)) candidates.push(url.href.replace(/\/$/, ""));
     } catch { /* 忽略旧配置中的无效地址。 */ }
   }
-  if (domain) candidates.push(`https://${domain}/api`, `https://demo.${domain}/api`, `http://${domain}/api`, `http://demo.${domain}/api`);
+  if (domain) candidates.push(`https://${domain}/api`, `https://node.${domain}/api`, `http://${domain}/api`, `http://node.${domain}/api`);
   const address = isIP(serverHost) === 6 ? `[${serverHost}]` : serverHost;
   candidates.push(`http://${address}:${port}/api`);
   return [...new Set(candidates)].sort((a, b) => Number(b.startsWith("https:")) - Number(a.startsWith("https:")));
@@ -396,7 +405,7 @@ export async function deployNode(credentials: ServerCredentials, log: (message: 
     await exec(client, `mkdir ${quote(`${uploadDir}/src`)}`);
     const wrapper = await new Promise<SFTPWrapper>((resolveSftp, reject) => client.sftp((error, value) => error ? reject(error) : resolveSftp(value)));
     try {
-      await Promise.all(sourceFiles.map((file) => new Promise<void>((resolveUpload, reject) => {
+      await Promise.all(listSourceFiles(sourceRoot).map((file) => new Promise<void>((resolveUpload, reject) => {
         const timer = setTimeout(() => reject(new Error(`上传 ${file} 超时`)), 30000);
         wrapper.fastPut(resolve(sourceRoot, file), `${uploadDir}/src/${file}`, (error) => {
           clearTimeout(timer); if (error) reject(error); else resolveUpload();

@@ -1,0 +1,20 @@
+# 控制中心对外入口：Caddy 自动签发并续期 HTTPS 证书（HTTP-01）。
+# 把 nexious.example.com 替换为解析到本服务器的域名，然后重命名为 Caddyfile。
+#
+# reverse_proxy 默认支持 WebSocket 升级：桌面端 REST 与 agent 中继（/relay、/relay-bridge）
+# 共用这一入口，无需额外配置。
+
+nexious.example.com {
+	reverse_proxy server:8787
+}
+
+# 建议补充安全响应头（可选，按需开启）：
+# nexious.example.com {
+# 	header {
+# 		Strict-Transport-Security "max-age=31536000"
+# 		X-Content-Type-Options "nosniff"
+# 		Referrer-Policy "no-referrer"
+# 		-Server
+# 	}
+# 	reverse_proxy server:8787
+# }

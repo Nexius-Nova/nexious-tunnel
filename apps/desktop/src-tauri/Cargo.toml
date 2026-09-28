@@ -18,6 +18,10 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# relay 连接的自定义 TLS 配置：webpki 公共根 + 内置官方 CA（自签 IP 证书入口）。
+# 只启用 ring provider，避免 aws-lc-rs 在 Windows 上引入 cmake/NASM 构建依赖。
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+webpki-roots = "0.26"
 futures-util = "0.3"
 url = "2"
 base64 = "0.22"

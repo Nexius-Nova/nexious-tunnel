@@ -1,0 +1,79 @@
+# Nexious Tunnel 控制中心生产部署：MySQL 8 + 控制中心 API + Caddy 自动 HTTPS。
+#
+# 使用步骤（详见同目录 README.md）：
+#   1. cp .env.production.example .env   并填好其中所有必填项
+#   2. cp Caddyfile.example Caddyfile    并把域名替换为你的
+#   3. docker compose up -d --build
+#
+# 环境变量来源：compose 会自动加载同目录 .env 做变量插值，同时整份注入 server 容器。
+name: nexious-tunnel
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: ${NEXIOUS_MYSQL_DATABASE:-nexious_tunnel}
+      MYSQL_USER: ${NEXIOUS_MYSQL_USER:-nexious_tunnel_app}
+      MYSQL_PASSWORD: ${NEXIOUS_MYSQL_PASSWORD:?请在 deploy/.env 中设置 NEXIOUS_MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 deploy/.env 中设置 MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    # 数据库不对外暴露端口：仅限 compose 内部网络访问。
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 容器内必须监听全部网卡；对外流量只经 Caddy 进入。
+      BIND_HOST: 0.0.0.0
+      NEXIOUS_DB_DRIVER: mysql
+      NEXIOUS_MYSQL_HOST: mysql
+      NEXIOUS_MYSQL_PORT: "3306"
+      # 流量先经 Caddy（可信反代）再到源站，开启后才能拿到真实客户端 IP。
+      NEXIOUS_TRUST_PROXY_HEADERS: "1"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      # 源站不直接暴露公网：仅本机回环可访问，供排障。
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      # /api/health 为公开端点，node 自带 fetch，无需额外安装 curl。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - server
+
+volumes:
+  mysql-data:
+  caddy-data:
+  caddy-config:
