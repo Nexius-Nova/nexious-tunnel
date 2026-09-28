@@ -91,6 +91,18 @@ export interface Preferences {
   // 偏好结构版本（桌面端内部使用）：≥3 表示当前版本配置，加载时不再做默认地址迁移。
   schemaVersion?: number;
 }
+export interface UpdateAsset {
+  name: string;
+  url: string;
+}
+export interface UpdateInfo {
+  current_version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  notes: string | null;
+  release_url: string;
+  assets: UpdateAsset[];
+}
 export interface TunnelInput {
   name: string;
   protocol: Tunnel["protocol"];

@@ -1283,6 +1283,140 @@ fn get_desktop_preferences(
         .map_err(|_| "桌面设置不可用".to_string())
 }
 
+// ── 检查更新 ─────────────────────────────────────────────────────────────
+// 更新源为 GitHub Releases（latest）。下载域名在部分网络环境不可直连，
+// 因此只做版本检查并引导用户前往发布页手动下载，不做进程内自动更新。
+const UPDATE_RELEASE_API: &str =
+    "https://api.github.com/repos/Nexius-Nova/nexious-tunnel/releases/latest";
+const RELEASE_PAGE_URL: &str = "https://github.com/Nexius-Nova/nexious-tunnel/releases";
+const RELEASE_PAGE_HOST_PREFIX: &str = "https://github.com/Nexius-Nova/nexious-tunnel";
+
+// 语义化版本比较（仅 x.y.z 数字段）：a > b 返回 Greater，相等 Equal，a < b 返回 Less。
+// 非数字段按 0 处理，长度不足补 0，保证 "1.0" 与 "1.0.0" 视为相等。
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parse(value: &str) -> Vec<u64> {
+        value
+            .trim()
+            .trim_start_matches('v')
+            .split('.')
+            .map(|part| part.trim().parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let (left, right) = (parse(a), parse(b));
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        let l = left.get(index).copied().unwrap_or(0);
+        let r = right.get(index).copied().unwrap_or(0);
+        if l != r {
+            return l.cmp(&r);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[derive(serde::Serialize)]
+struct UpdateAsset {
+    name: String,
+    url: String,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    current_version: String,
+    latest_version: Option<String>,
+    update_available: bool,
+    notes: Option<String>,
+    release_url: String,
+    assets: Vec<UpdateAsset>,
+}
+
+#[tauri::command]
+async fn check_app_update(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+    let current_version = app.package_info().version.to_string();
+    let client = build_api_client();
+    let response = client
+        .get(UPDATE_RELEASE_API)
+        .header("user-agent", "nexious-tunnel")
+        .header("accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|_| "无法连接更新服务器，请检查网络后重试".to_string())?
+        .error_for_status()
+        .map_err(|_| "更新服务器返回异常状态".to_string())?;
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "更新信息解析失败".to_string())?;
+
+    let latest_version = payload["tag_name"]
+        .as_str()
+        .map(|tag| tag.trim().trim_start_matches('v').to_string())
+        .filter(|value| !value.is_empty());
+    let update_available = latest_version
+        .as_deref()
+        .map(|latest| compare_versions(latest, &current_version) == std::cmp::Ordering::Greater)
+        .unwrap_or(false);
+    // 发布说明为 Markdown 原文，仅截取开头一段用于预览。
+    let notes = payload["body"]
+        .as_str()
+        .map(|text| text.trim().chars().take(600).collect::<String>())
+        .filter(|text| !text.is_empty());
+    let release_url = payload["html_url"]
+        .as_str()
+        .filter(|url| url.starts_with(RELEASE_PAGE_HOST_PREFIX))
+        .unwrap_or(RELEASE_PAGE_URL)
+        .to_string();
+    let mut assets: Vec<UpdateAsset> = payload["assets"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let name = item["name"].as_str()?.to_string();
+                    let url = item["browser_download_url"].as_str()?.to_string();
+                    if url.starts_with(RELEASE_PAGE_HOST_PREFIX)
+                        && (name.ends_with(".exe") || name.ends_with(".msi"))
+                    {
+                        Some(UpdateAsset { name, url })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assets.sort_by(|a, b| b.name.cmp(&a.name));
+    Ok(UpdateInfo {
+        current_version,
+        latest_version,
+        update_available,
+        notes,
+        release_url,
+        assets,
+    })
+}
+
+// 用系统默认浏览器打开发布页。仅放行本仓库域名下的地址，防止被诱导跳转任意 URL。
+#[tauri::command]
+fn open_release_page(url: String) -> Result<(), String> {
+    if !url.starts_with(RELEASE_PAGE_HOST_PREFIX) || url.chars().any(char::is_whitespace) {
+        return Err("不支持的链接地址".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&url)
+            .spawn()
+            .map_err(|error| format!("无法打开浏览器：{error}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = url;
+    }
+    Ok(())
+}
+
 // 本地控制中心运行参数的取值范围；超出时直接拒绝保存。
 fn validate_runtime_settings(settings: &DesktopPreferences) -> Result<(), String> {
     if !(1..=1024).contains(&settings.max_body_mb) {
@@ -1565,7 +1699,9 @@ pub fn run() {
             secure_session::get_node_password,
             secure_session::save_node_password,
             secure_session::clear_node_password,
-            api_request
+            api_request,
+            check_app_update,
+            open_release_page
         ])
         .build(tauri::generate_context!())
         .expect("error while building Nexious Tunnel");

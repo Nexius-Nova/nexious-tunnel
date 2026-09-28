@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { useQueryClient } from "@tanstack/vue-query";
 import { NAlert, NButton, NInputNumber, NSwitch, useMessage } from "naive-ui";
-import { MonitorUp, Moon, PanelTopClose, Save } from "lucide-vue-next";
-import type { Preferences } from "../types";
+import { CheckCircle2, Download, MonitorUp, Moon, PanelTopClose, RefreshCw, Save } from "lucide-vue-next";
+import type { Preferences, UpdateInfo } from "../types";
 import PageHeader from "../components/PageHeader.vue";
 import StateBlock from "../components/StateBlock.vue";
 import ThemeStylePicker from "../components/ThemeStylePicker.vue";
@@ -104,6 +105,34 @@ async function updateDesktopPreference(
 function setTheme(value:boolean) {
   setThemeMode(!value);
 }
+
+// ── 检查更新 ────────────────────────────────────────────────────────────
+// 版本信息来自 GitHub Releases；下载在系统浏览器中完成（应用内不做自动更新）。
+const appVersion = ref("");
+const checkingUpdate = ref(false);
+const updateInfo = ref<UpdateInfo | null>(null);
+onMounted(async () => {
+  if (!native) return;
+  try { appVersion.value = await getVersion(); } catch { /* 版本号仅用于展示 */ }
+});
+async function checkForUpdate() {
+  if (!native || checkingUpdate.value) return;
+  checkingUpdate.value = true;
+  try {
+    updateInfo.value = await invoke<UpdateInfo>("check_app_update");
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
+async function openRelease(url: string) {
+  try {
+    await invoke("open_release_page", { url });
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error));
+  }
+}
 </script>
 
 <template>
@@ -171,6 +200,29 @@ function setTheme(value:boolean) {
         <h2>控制中心</h2>
         <p class="section-description">客户端固定连接本机内置的控制中心，无需手动配置地址；边缘节点凭据在“边缘节点”页面维护。</p>
       </section>
+      <section v-if="native" class="settings-panel">
+        <h2>关于与更新</h2>
+        <div class="setting-row">
+          <div><b>当前版本</b><span>Nexious Tunnel{{ appVersion ? ` v${appVersion}` : "" }}</span></div>
+          <n-button :loading="checkingUpdate" @click="checkForUpdate">
+            <template #icon><RefreshCw /></template>检查更新
+          </n-button>
+        </div>
+        <div v-if="updateInfo" class="setting-row update-result">
+          <i :class="updateInfo.update_available ? 'has-update' : 'is-latest'">
+            <Download v-if="updateInfo.update_available" />
+            <CheckCircle2 v-else />
+          </i>
+          <div>
+            <b v-if="updateInfo.update_available">发现新版本 v{{ updateInfo.latest_version }}</b>
+            <b v-else>已是最新版本</b>
+            <span v-if="updateInfo.update_available && updateInfo.notes">{{ updateInfo.notes }}</span>
+          </div>
+          <n-button v-if="updateInfo.update_available" type="primary" @click="openRelease(updateInfo.release_url)">
+            <template #icon><Download /></template>前往下载
+          </n-button>
+        </div>
+      </section>
     </template>
     <transition name="save-pill">
       <div v-if="native && !loadError && changed" class="save-pill">
@@ -237,4 +289,15 @@ function setTheme(value:boolean) {
 .settings-panel .setting-row > div b{display:block;font-size:13px}
 .settings-panel .setting-row > div span{display:block;margin-top:3px;color:var(--text-secondary);font-size:11px}
 .number-input{width:150px}
+/* 更新结果行：图标按状态着色，说明文字最多三行截断 */
+.settings-view :deep(.update-result > i){color:var(--text-secondary)}
+.settings-view :deep(.update-result > i.is-latest){color:var(--accent, #22a06b)}
+.settings-view :deep(.update-result > i.has-update){color:var(--amber, #d97706)}
+.settings-view :deep(.update-result span){
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+  white-space:pre-line;
+}
 </style>
