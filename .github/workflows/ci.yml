@@ -43,5 +43,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       # generate_context! 需要读取 frontendDist，先构建前端产物
       - run: pnpm --filter @nexious/desktop exec vite build
+      # generate_context! 校验 tauri resources（node.exe 与本地 API 运行时），须先准备 sidecar 资源
+      - run: pnpm --filter @nexious/desktop prepare-runtime
       - name: Cargo test
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
